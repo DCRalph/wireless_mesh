@@ -303,12 +303,12 @@ bool Wireless::begin()
   // Note: keep global callback trampoline for ESPNOW C callbacks.
   esp_now_register_send_cb([](const uint8_t *mac_addr,
                               esp_now_send_status_t status)
-                           { Wireless::getInstance().sendCallback(mac_addr, status); });
+                           { Wireless::getInstance()->sendCallback(mac_addr, status); });
 
   esp_now_register_recv_cb([](const uint8_t *mac_addr,
                               const uint8_t *data,
                               int len)
-                           { Wireless::getInstance().recvCallback(mac_addr, data, static_cast<uint16_t>(len)); });
+                           { Wireless::getInstance()->recvCallback(mac_addr, data, static_cast<uint16_t>(len)); });
 
   esp_now_peer_info_t broadcastPeer{};
   const TransportAddress broadcast = broadcastAddress();
