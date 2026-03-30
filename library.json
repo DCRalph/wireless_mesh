@@ -1,0 +1,22 @@
+{
+  "name": "Wireless Mesh",
+  "keywords": "mesh, networking, esp32, esp-now",
+  "description": "A library for wireless mesh networking",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dcralph/wireless_mesh.git"
+  },
+  "authors": {
+    "name": "William Giles",
+    "email": "me@williamgiles.co.nz",
+    "url": "https://github.com/dcralph"
+  },
+  "version": "1.0.0",
+  "examples": "examples/*/*.ino",
+  "frameworks": "arduino",
+  "platforms": [
+    "atmelavr",
+    "espressif8266",
+    "espressif32"
+  ]
+}
