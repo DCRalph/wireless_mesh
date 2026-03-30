@@ -20,10 +20,10 @@ namespace
   }
 } // namespace
 
-Wireless &Wireless::instance()
+Wireless *Wireless::getInstance()
 {
-  static Wireless instance_;
-  return instance_;
+  static Wireless inst;
+  return &inst;
 }
 
 Wireless::Wireless()

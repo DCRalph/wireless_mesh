@@ -51,7 +51,7 @@ private:
   ReceiveCallback receiveCb;
 
 public:
-  static Wireless &instance();
+  static Wireless *getInstance();
 
   Wireless(const Wireless &) = delete;
   Wireless &operator=(const Wireless &) = delete;
