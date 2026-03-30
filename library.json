@@ -11,7 +11,7 @@
     "email": "me@williamgiles.co.nz",
     "url": "https://github.com/dcralph"
   },
-  "version": "1.0.0",
+  "version": "1.0.1",
   "examples": "examples/*/*.ino",
   "frameworks": "arduino",
   "platforms": [
