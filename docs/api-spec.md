@@ -27,9 +27,9 @@ This document describes the current public API exposed by the mesh layer in `src
 
 #### `void begin();`
 
-- Marks the manager as started.
 - Requires a transport to already be provided with `setTransport()`.
 - If the transport exists but is not ready, calls `transport->begin()`.
+- Leaves the manager stopped if transport bring-up fails or the transport is still not ready afterward.
 - Registers the receive callback, derives the local device ID, seeds the frame sequence counter, and loads persisted sync mode preferences.
 
 #### `void loop();`
@@ -41,6 +41,7 @@ This document describes the current public API exposed by the mesh layer in `src
 #### `void setTransport(ITransport *transport);`
 
 - Installs the transport implementation used for mesh traffic.
+- The pointer is non-owning; the caller keeps lifetime responsibility for the transport object.
 - The repository includes `Wireless`, an ESP-NOW transport intended for ESP32-class targets.
 - Transport details for `ITransport`, `TransportPacket`, transport-defined addressing, and `Wireless` are documented in [wireless.md](wireless.md).
 
@@ -60,7 +61,7 @@ This document describes the current public API exposed by the mesh layer in `src
 
 ```cpp
 SyncManager *sync = SyncManager::getInstance();
-sync->setTransport(&Wireless::instance());
+sync->setTransport(Wireless::getInstance());
 sync->setModePersistence(loadMode, saveMode);
 sync->setDeviceIdProvider(getStableDeviceId);
 sync->begin();

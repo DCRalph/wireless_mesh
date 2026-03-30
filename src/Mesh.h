@@ -395,7 +395,7 @@ public:
 
   void begin();
   void loop();
-  void setTransport(ITransport *transport);
+  void setTransport(ITransport *transport); // Non-owning transport pointer.
   ITransport *getTransport() const;
   void setModePersistence(std::function<uint8_t()> loadCb,
                           std::function<void(uint8_t)> saveCb);
@@ -562,6 +562,7 @@ private:
   bool isRelayedFrame(const MeshProtocol::DecodedFrame &frame) const;
   bool isGroupMember(uint32_t deviceId) const;
   bool sourceMatchesDevice(const TransportAddress &source, uint32_t deviceId, bool isRelayed) const;
+  bool sendBroadcastPacketChecked(const TransportPacket &pkt, const char *context) const;
   bool sendPacketChecked(const TransportPacket &pkt, const TransportAddress &peer, const char *context) const;
   bool getMasterAddress(TransportAddress &outAddress) const;
   uint32_t generateDeviceId();

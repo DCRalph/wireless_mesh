@@ -705,22 +705,29 @@ SyncManager::~SyncManager() {}
 
 void SyncManager::begin()
 {
-  started_ = true;
-  if (transport_ == nullptr)
+  ITransport *transport = transport_;
+  started_ = false;
+  localAddress_.clear();
+  if (transport == nullptr)
   {
     return; // Application must call setTransport() before begin()
   }
 
-  if (!transport_->isReady())
+  if (!transport->isReady() && !transport->begin())
   {
-    transport_->begin();
+    return;
   }
 
-  transport_->setReceiveCallback(
+  if (!transport->isReady())
+  {
+    return;
+  }
+
+  transport->setReceiveCallback(
       [this](const TransportAddress &source, const TransportPacket &packet)
       { handleTransportFrame(source, packet); });
 
-  localAddress_ = transport_->localAddress();
+  localAddress_ = transport->localAddress();
 
   ourDeviceId = generateDeviceId();
   nextSequence_ = esp_random();
@@ -730,6 +737,7 @@ void SyncManager::begin()
   }
 
   loadPreferences();
+  started_ = true;
 }
 
 void SyncManager::loop()
@@ -908,7 +916,7 @@ void SyncManager::joinGroup(uint32_t groupId)
                            payload.data(),
                            static_cast<uint16_t>(payload.size())))
   {
-    sendPacketChecked(pkt, transport_->broadcastAddress(), "group-join");
+    sendBroadcastPacketChecked(pkt, "group-join");
   }
 
   // Request immediate time sync after joining
@@ -943,7 +951,7 @@ void SyncManager::leaveGroup()
 
   for (uint8_t attempt = 0; attempt < 3; ++attempt)
   {
-    sendPacketChecked(pkt, transport_->broadcastAddress(), "group-leave");
+    sendBroadcastPacketChecked(pkt, "group-leave");
   }
   if (currentGroup.isMaster)
   {
@@ -1095,7 +1103,7 @@ void SyncManager::requestTimeSync()
   {
     return;
   }
-  sendPacketChecked(pkt, transport_->broadcastAddress(), "time-request");
+  sendBroadcastPacketChecked(pkt, "time-request");
 }
 
 bool SyncManager::isTimeSynced() const
@@ -1618,7 +1626,7 @@ void SyncManager::processTimeRequest(const MeshProtocol::DecodedFrame &frame, co
                            reinterpret_cast<const uint8_t *>(&responseCmd),
                            sizeof(responseCmd)))
   {
-    sendPacketChecked(pkt, transport_->broadcastAddress(), "time-response");
+    sendBroadcastPacketChecked(pkt, "time-response");
   }
 }
 
@@ -1681,7 +1689,7 @@ void SyncManager::sendHeartbeat()
                            payload.data(),
                            static_cast<uint16_t>(payload.size())))
   {
-    sendPacketChecked(pkt, transport_->broadcastAddress(), "heartbeat");
+    sendBroadcastPacketChecked(pkt, "heartbeat");
   }
 #ifdef DEBUG_ESP_NOW
   if (DEBUG_ESP_NOW >= 2)
@@ -1713,7 +1721,7 @@ void SyncManager::sendGroupAnnounce()
                            payload.data(),
                            static_cast<uint16_t>(payload.size())))
   {
-    sendPacketChecked(pkt, transport_->broadcastAddress(), "group-announce");
+    sendBroadcastPacketChecked(pkt, "group-announce");
   }
 }
 
@@ -1748,7 +1756,7 @@ void SyncManager::sendGroupInfo()
                            payload.data(),
                            static_cast<uint16_t>(payload.size())))
   {
-    sendPacketChecked(pkt, transport_->broadcastAddress(), "group-info");
+    sendBroadcastPacketChecked(pkt, "group-info");
   }
 }
 
@@ -2046,8 +2054,17 @@ void SyncManager::printSyncModeInfo()
 
 void SyncManager::setTransport(ITransport *transport)
 {
+  if (transport_ == transport)
+  {
+    return;
+  }
+  if (transport_ != nullptr)
+  {
+    transport_->setReceiveCallback(ITransport::ReceiveCallback{});
+  }
   transport_ = transport;
   localAddress_.clear();
+  started_ = false;
 }
 
 ITransport *SyncManager::getTransport() const
@@ -2156,7 +2173,7 @@ void SyncManager::forwardRelayFrame(const MeshProtocol::DecodedFrame &frame)
     return;
   }
 
-  sendPacketChecked(relayPkt, transport_->broadcastAddress(), "relay-forward");
+  sendBroadcastPacketChecked(relayPkt, "relay-forward");
 }
 
 uint64_t SyncManager::relayFrameKey(uint32_t originDeviceId, uint32_t sequence) const
@@ -2286,7 +2303,7 @@ bool SyncManager::setPropertyBytes(uint16_t key, const uint8_t *data, uint8_t le
   {
     return false;
   }
-  if (!sendPacketChecked(pkt, transport_->broadcastAddress(), "property-update"))
+  if (!sendBroadcastPacketChecked(pkt, "property-update"))
   {
     return false;
   }
@@ -2360,7 +2377,7 @@ bool SyncManager::emitEventBytes(uint16_t channelId, const uint8_t *payload, uin
   {
     return false;
   }
-  if (!sendPacketChecked(pkt, transport_->broadcastAddress(), "event-emit"))
+  if (!sendBroadcastPacketChecked(pkt, "event-emit"))
   {
     return false;
   }
@@ -2546,7 +2563,7 @@ void SyncManager::reannounceProperties(uint32_t now, bool force)
                              payload.data(),
                              static_cast<uint16_t>(payload.size())))
     {
-      sendPacketChecked(pkt, transport_->broadcastAddress(), "property-batch");
+      sendBroadcastPacketChecked(pkt, "property-batch");
     }
     payload.clear();
     payload.push_back(0);
@@ -2743,9 +2760,18 @@ bool SyncManager::sourceMatchesDevice(const TransportAddress &source, uint32_t d
   return false;
 }
 
+bool SyncManager::sendBroadcastPacketChecked(const TransportPacket &pkt, const char *context) const
+{
+  if (transport_ == nullptr || !transport_->isReady())
+  {
+    return false;
+  }
+  return sendPacketChecked(pkt, transport_->broadcastAddress(), context);
+}
+
 bool SyncManager::sendPacketChecked(const TransportPacket &pkt, const TransportAddress &peer, const char *context) const
 {
-  if (transport_ == nullptr)
+  if (transport_ == nullptr || !transport_->isReady())
   {
     return false;
   }

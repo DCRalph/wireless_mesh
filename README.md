@@ -42,13 +42,15 @@ Typical usage is:
 
 ```cpp
 SyncManager *sync = SyncManager::getInstance();
-sync->setTransport(&Wireless::instance());
+sync->setTransport(Wireless::getInstance());
 sync->begin();
 
 void loop() {
   sync->loop();
 }
 ```
+
+`Wireless::getInstance()` returns a non-owning singleton transport pointer. Tear it down with `end()` or `unSetup()`, not `delete`.
 
 ## Documentation
 

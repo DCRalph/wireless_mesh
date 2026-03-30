@@ -51,7 +51,7 @@ private:
   ReceiveCallback receiveCb;
 
 public:
-  static Wireless *getInstance();
+  static Wireless *getInstance(); // Non-owning singleton; do not delete.
 
   Wireless(const Wireless &) = delete;
   Wireless &operator=(const Wireless &) = delete;

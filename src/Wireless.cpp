@@ -329,25 +329,27 @@ bool Wireless::begin()
 
 void Wireless::end()
 {
-  if (!setupDone)
+  if (setupDone)
   {
-    return;
+    if (broadcastPeerConfigured_)
+    {
+      const TransportAddress broadcast = broadcastAddress();
+      esp_now_del_peer(broadcast.data());
+      broadcastPeerConfigured_ = false;
+    }
+    esp_now_unregister_recv_cb();
+    esp_now_unregister_send_cb();
+    esp_now_deinit();
+    if (incomingQueue_ != nullptr)
+    {
+      vQueueDelete(incomingQueue_);
+      incomingQueue_ = nullptr;
+    }
+    setupDone = false;
   }
-  if (broadcastPeerConfigured_)
-  {
-    const TransportAddress broadcast = broadcastAddress();
-    esp_now_del_peer(broadcast.data());
-    broadcastPeerConfigured_ = false;
-  }
-  esp_now_unregister_recv_cb();
-  esp_now_unregister_send_cb();
-  esp_now_deinit();
-  if (incomingQueue_ != nullptr)
-  {
-    vQueueDelete(incomingQueue_);
-    incomingQueue_ = nullptr;
-  }
-  setupDone = false;
+  receiveCb = ReceiveCallback{};
+  onReceiveOtherCb = {};
+  onReceiveForCallbacks.clear();
 }
 
 bool Wireless::isReady() const

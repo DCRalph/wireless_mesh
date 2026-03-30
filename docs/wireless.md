@@ -68,7 +68,9 @@ The mesh layer does not depend on ESP-NOW-specific APIs directly. Any alternativ
 
 ### Lifecycle
 
-- `Wireless::instance()` returns the single supported ESP-NOW transport instance.
+- `Wireless::getInstance()` returns the single supported ESP-NOW transport instance.
+- The returned pointer is non-owning because the transport lives in static storage.
+- Do not delete the singleton; call `end()` or `unSetup()` to tear down ESP-NOW resources.
 - `setup()` is a backward-compatible alias for `begin()`.
 - `unSetup()` is a backward-compatible alias for `end()`.
 - `isSetupDone()` and `isReady()` both expose whether the transport has been initialized.
@@ -89,7 +91,7 @@ The mesh layer does not depend on ESP-NOW-specific APIs directly. Any alternativ
 4. Creates the RX queue if needed.
    - queue depth is `Wireless::kRxQueueDepth`, currently `16`
 5. Resets the dropped-frame counter.
-6. Registers ESP-NOW send and receive callback trampolines that dispatch through `Wireless::instance()`.
+6. Registers ESP-NOW send and receive callback trampolines that dispatch through `Wireless::getInstance()`.
 7. Adds the transport broadcast peer returned by `broadcastAddress()` on `WIFI_IF_STA`, with `encrypt = false`.
 
 If queue creation fails, `begin()` deinitializes ESP-NOW and returns `false`.
@@ -102,6 +104,7 @@ If queue creation fails, `begin()` deinitializes ESP-NOW and returns `false`.
 - unregisters ESP-NOW callbacks
 - deinitializes ESP-NOW
 - deletes the RX queue
+- clears registered receive callbacks
 - clears the setup flag
 
 ## 4) Receive path
@@ -214,7 +217,7 @@ Typical integration with the mesh layer looks like:
 
 ```cpp
 SyncManager *sync = SyncManager::getInstance();
-sync->setTransport(&Wireless::instance());
+sync->setTransport(Wireless::getInstance());
 sync->begin();
 
 void loop() {
