@@ -41,10 +41,18 @@ class Wireless : public ITransport
 private:
   static constexpr uint8_t kRxQueueDepth = 16;
   static constexpr uint8_t kAddressLength = ESP_NOW_ETH_ALEN;
+  // ESP-NOW's peer table holds ~20 entries. The broadcast peer takes one,
+  // so cap our unicast LRU at 18 (one slot of headroom).
+  static constexpr uint8_t kMaxCachedPeers = 18;
+
   std::atomic<bool> setupDone{false};
   bool broadcastPeerConfigured_ = false;
   QueueHandle_t incomingQueue_ = nullptr;
   std::atomic<uint32_t> droppedRxFrames_{0};
+
+  // LRU peer cache. Index 0 is least-recently-used, peerCacheSize_-1 is MRU.
+  std::array<std::array<uint8_t, ESP_NOW_ETH_ALEN>, kMaxCachedPeers> peerCache_{};
+  uint8_t peerCacheSize_ = 0;
 
   std::function<void(WirelessFrame *frame)> onReceiveOtherCb;
   std::map<uint16_t, std::function<void(WirelessFrame *frame)>> onReceiveForCallbacks;
@@ -241,5 +249,7 @@ public:
 private:
   Wireless();
   bool ensurePeerRegistered(const uint8_t *peer_addr);
+  bool addPeerToEspNow(const uint8_t *peer_addr);
+  void promoteToMru(uint8_t index);
   std::atomic<esp_now_send_status_t> lastStatus_{ESP_NOW_SEND_FAIL};
 };

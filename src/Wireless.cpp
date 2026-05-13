@@ -180,11 +180,45 @@ bool Wireless::ensurePeerRegistered(const uint8_t *peer_addr)
   {
     return false;
   }
-  if (esp_now_is_peer_exist(peer_addr))
+
+  // Broadcast peer is added in begin() and lives outside the LRU cache.
+  if (memcmp(peer_addr, kBroadcastMac, ESP_NOW_ETH_ALEN) == 0)
   {
-    return true;
+    return esp_now_is_peer_exist(peer_addr) || addPeerToEspNow(peer_addr);
   }
 
+  // Promote to MRU on hit.
+  for (uint8_t i = 0; i < peerCacheSize_; ++i)
+  {
+    if (memcmp(peerCache_[i].data(), peer_addr, ESP_NOW_ETH_ALEN) == 0)
+    {
+      promoteToMru(i);
+      return true;
+    }
+  }
+
+  // Miss: evict LRU if full, then register and append as MRU.
+  if (peerCacheSize_ == kMaxCachedPeers)
+  {
+    esp_now_del_peer(peerCache_[0].data());
+    for (uint8_t i = 0; i + 1 < peerCacheSize_; ++i)
+    {
+      peerCache_[i] = peerCache_[i + 1];
+    }
+    --peerCacheSize_;
+  }
+
+  if (!addPeerToEspNow(peer_addr))
+  {
+    return false;
+  }
+  memcpy(peerCache_[peerCacheSize_].data(), peer_addr, ESP_NOW_ETH_ALEN);
+  ++peerCacheSize_;
+  return true;
+}
+
+bool Wireless::addPeerToEspNow(const uint8_t *peer_addr)
+{
   esp_now_peer_info_t peerInfo{};
   memcpy(peerInfo.peer_addr, peer_addr, ESP_NOW_ETH_ALEN);
   peerInfo.channel = ESP_NOW_CHANNEL;
@@ -198,6 +232,20 @@ bool Wireless::ensurePeerRegistered(const uint8_t *peer_addr)
   }
   Serial.printf("esp_now_add_peer failed: %d\n", err);
   return false;
+}
+
+void Wireless::promoteToMru(uint8_t index)
+{
+  if (index + 1 >= peerCacheSize_)
+  {
+    return;
+  }
+  const std::array<uint8_t, ESP_NOW_ETH_ALEN> saved = peerCache_[index];
+  for (uint8_t i = index; i + 1 < peerCacheSize_; ++i)
+  {
+    peerCache_[i] = peerCache_[i + 1];
+  }
+  peerCache_[peerCacheSize_ - 1] = saved;
 }
 
 int Wireless::send(const uint8_t *data, uint16_t len, const TransportAddress &peer)
@@ -284,7 +332,8 @@ void Wireless::end()
     }
     esp_now_unregister_recv_cb();
     esp_now_unregister_send_cb();
-    esp_now_deinit();
+    esp_now_deinit(); // also drops the peer table
+    peerCacheSize_ = 0;
     if (incomingQueue_ != nullptr)
     {
       vQueueDelete(incomingQueue_);
