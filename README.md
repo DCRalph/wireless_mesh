@@ -1,9 +1,10 @@
 # Wireless Mesh
 
-`Wireless Mesh` is an Arduino-oriented mesh synchronization library built around two layers:
+`Wireless Mesh` is an Arduino-oriented mesh synchronization library built around three layers:
 
 - a transport layer, with an included ESP-NOW `Wireless` implementation
 - a mesh layer, centered on `SyncManager`, that handles discovery, groups, time sync, replicated properties, events, and optional relay
+- a direct-comms layer, `DirectComms`, for typed point-to-point sends and request/response between two ESPs without any group setup
 
 ## What It Provides
 
@@ -37,6 +38,8 @@ The included transport implementation is ESP32-oriented:
   - ESP-NOW transport implementation
 - `src/Mesh.h` / `src/Mesh.cpp`
   - mesh protocol, `SyncManager`, property/event handling, group state, relay, and time sync
+- `src/Direct.h` / `src/Direct.cpp`
+  - `DirectComms`, `DirectChannel<T>`, and `DirectRpc<Req, Resp>` for two-ESP direct comms; runs alongside `SyncManager` on the same `Wireless` transport
 
 Typical usage is:
 
@@ -59,13 +62,23 @@ void loop() {
 - [`docs/wireless.md`](docs/wireless.md)
   - transport primitives, transport-defined addressing, ESP-NOW setup, callback flow, peer handling, and singleton usage
 - [`docs/api-spec.md`](docs/api-spec.md)
-  - public mesh API reference for `SyncManager`, `PropertyHandle`, `RawPropertyHandle`, and `EventHandle`
+  - public mesh API reference for `SyncManager`, `PropertyHandle`, `RawPropertyHandle`, `EventHandle`, plus `DirectComms`, `DirectChannel<T>`, and `DirectRpc<Req, Resp>`
+- [`docs/direct.md`](docs/direct.md)
+  - design notes, framing, and worked examples for `DirectComms` (two-ESP direct comms with optional request/response and timeout)
 
 ## Installation Notes
 
 - Arduino library metadata is included via `library.properties`.
 - PlatformIO metadata is included via `library.json`.
-- `library.json` references `examples/*/*.ino`, but this repository currently does not include an `examples/` directory.
+- The `examples/` directory contains `DirectPing`, `DirectRpc`, and `DirectAndMesh` sketches demonstrating `DirectComms` and its coexistence with `SyncManager`.
+- **C++17 is required.** Mesh and Direct headers use `std::enable_if_t`, `std::is_void_v`, and lambda init-captures. PlatformIO ESP32 defaults to `gnu++11`, so add the following to your project's `platformio.ini`:
+
+  ```ini
+  build_unflags = -std=gnu++11
+  build_flags = -std=gnu++17
+  ```
+
+  Recent Arduino-ESP32 cores (3.x) already default to `gnu++17` and need no extra flags.
 
 ## License
 

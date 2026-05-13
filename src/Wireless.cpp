@@ -13,11 +13,6 @@
 namespace
 {
   constexpr uint8_t kBroadcastMac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
-  bool isBroadcastMac(const uint8_t *mac)
-  {
-    return memcmp(mac, kBroadcastMac, ESP_NOW_ETH_ALEN) == 0;
-  }
 } // namespace
 
 Wireless *Wireless::getInstance()
@@ -42,29 +37,25 @@ void Wireless::unSetup()
 
 void Wireless::loop()
 {
-  if (!setupDone)
-  {
-    return;
-  }
-  if (incomingQueue_ == nullptr)
+  if (!setupDone.load(std::memory_order_acquire) || incomingQueue_ == nullptr)
   {
     return;
   }
 
-  WirelessFrame frame{};
+  WirelessFrame frame;
   while (xQueueReceive(incomingQueue_, &frame, 0) == pdTRUE)
   {
     if (receiveCb)
     {
-      TransportAddress source = TransportAddress::fromMac(frame.mac);
-      receiveCb(source, frame.packet);
+      receiveCb(TransportAddress::fromMac(frame.mac), frame.packet);
     }
 
-    // Call a type-specific callback if available, otherwise the generic one.
     auto it = onReceiveForCallbacks.find(frame.packet.type);
     if (it != onReceiveForCallbacks.end())
     {
-      it->second(&frame);
+      // Copy out for re-entrancy: the handler may add/remove map entries.
+      auto cb = it->second;
+      cb(&frame);
     }
     else if (onReceiveOtherCb)
     {
@@ -75,7 +66,7 @@ void Wireless::loop()
 
 bool Wireless::isSetupDone() const
 {
-  return setupDone;
+  return setupDone.load(std::memory_order_acquire);
 }
 
 void Wireless::sendCallback(const uint8_t *mac_addr,
@@ -101,29 +92,27 @@ void Wireless::sendCallback(const uint8_t *mac_addr,
 void Wireless::recvCallback(const uint8_t *mac_addr, const uint8_t *data,
                             uint16_t len)
 {
-  if (incomingQueue_ == nullptr || len < sizeof(uint16_t) * 2)
+  constexpr uint16_t kHeaderLen = sizeof(TransportPacket::type) + sizeof(TransportPacket::len);
+  if (incomingQueue_ == nullptr || data == nullptr || len < kHeaderLen)
   {
     return;
   }
 
-  const TransportPacket *p = reinterpret_cast<const TransportPacket *>(data);
-  if (p->len > sizeof(p->data))
-  {
-    return;
-  }
-  if (len < static_cast<uint16_t>(sizeof(p->type) + sizeof(p->len) + p->len))
+  WirelessFrame frame;
+  // TransportPacket is packed: type + len occupy the first kHeaderLen bytes.
+  memcpy(&frame.packet, data, kHeaderLen);
+
+  if (frame.packet.len > sizeof(frame.packet.data) ||
+      static_cast<uint16_t>(kHeaderLen + frame.packet.len) > len)
   {
     return;
   }
 
-  WirelessFrame frame{};
   memcpy(frame.mac, mac_addr, ESP_NOW_ETH_ALEN);
   frame.direction = PacketDirection::RECV;
-  frame.packet.type = p->type;
-  frame.packet.len = p->len;
-  if (p->len > 0)
+  if (frame.packet.len > 0)
   {
-    memcpy(frame.packet.data, p->data, p->len);
+    memcpy(frame.packet.data, data + kHeaderLen, frame.packet.len);
   }
 
   if (xQueueSendToBack(incomingQueue_, &frame, 0) != pdTRUE)
@@ -165,83 +154,50 @@ int Wireless::send(const TransportPacket *p, const TransportAddress &peer)
 
 int Wireless::send(const uint8_t *data, uint16_t len, const uint8_t *peer_addr)
 {
-  if (!setupDone)
+  if (!setupDone.load(std::memory_order_acquire))
   {
     Serial.println("ESP-NOW not initialized");
     return -1;
   }
 
-  esp_now_peer_info_t peerInfo;
-  memset(&peerInfo, 0, sizeof(peerInfo));
+  if (!ensurePeerRegistered(peer_addr))
+  {
+    return -1;
+  }
+
+  esp_err_t err = esp_now_send(peer_addr, data, len);
+  if (err != ESP_OK)
+  {
+    Serial.printf("esp_now_send failed: %d\n", err);
+    return -1;
+  }
+  return 0;
+}
+
+bool Wireless::ensurePeerRegistered(const uint8_t *peer_addr)
+{
+  if (peer_addr == nullptr)
+  {
+    return false;
+  }
+  if (esp_now_is_peer_exist(peer_addr))
+  {
+    return true;
+  }
+
+  esp_now_peer_info_t peerInfo{};
   memcpy(peerInfo.peer_addr, peer_addr, ESP_NOW_ETH_ALEN);
   peerInfo.channel = ESP_NOW_CHANNEL;
   peerInfo.encrypt = false;
-  // Explicitly select the WiFi interface (typically WIFI_IF_STA)
   peerInfo.ifidx = WIFI_IF_STA;
 
-#if DEBUG_ESP_NOW == 1
-  Serial.println("######################");
-  char peerStr[32];
-  int pos = 0;
-  for (int i = 0; i < ESP_NOW_ETH_ALEN; i++)
+  esp_err_t err = esp_now_add_peer(&peerInfo);
+  if (err == ESP_OK || err == ESP_ERR_ESPNOW_EXIST)
   {
-    pos += snprintf(peerStr + pos, sizeof(peerStr) - pos, "%02X ",
-                    peerInfo.peer_addr[i]);
+    return true;
   }
-  Serial.printf("Peer info: %s\n", peerStr);
-  Serial.printf("Channel: %d\n", peerInfo.channel);
-  Serial.printf("Encrypt: %d\n", peerInfo.encrypt);
-  uint16_t dataLen = data[1];
-  Serial.printf("Data:\n");
-  for (uint16_t i = 0; i < dataLen + 2; i++)
-  {
-    Serial.printf("%02X ", data[i]);
-  }
-  Serial.println("\n######################");
-#endif
-
-  const bool isBroadcast = isBroadcastMac(peer_addr);
-  bool removePeerAfterSend = !isBroadcast;
-  if (!isBroadcast)
-  {
-    if (!esp_now_is_peer_exist(peer_addr))
-    {
-      esp_err_t addErr = esp_now_add_peer(&peerInfo);
-      if (addErr != ESP_OK && addErr != ESP_ERR_ESPNOW_EXIST)
-      {
-        Serial.printf("Failed to add peer, error: %d\n", addErr);
-        return -1;
-      }
-    }
-  }
-#if DEBUG_ESP_NOW == 1
-  Serial.println("Peer added");
-#endif
-
-  esp_err_t err = esp_now_send(peerInfo.peer_addr, data, len);
-  if (err != ESP_OK)
-  {
-    Serial.printf("Failed to send data, error: %d\n", err);
-    if (removePeerAfterSend)
-    {
-      esp_now_del_peer(peer_addr);
-    }
-    return -1;
-  }
-#if DEBUG_ESP_NOW == 1
-  Serial.println("Data sent");
-#endif
-
-  if (removePeerAfterSend)
-  {
-    esp_now_del_peer(peer_addr);
-  }
-
-#if DEBUG_ESP_NOW == 1
-  Serial.println("######################");
-#endif
-
-  return 0;
+  Serial.printf("esp_now_add_peer failed: %d\n", err);
+  return false;
 }
 
 int Wireless::send(const uint8_t *data, uint16_t len, const TransportAddress &peer)
@@ -269,7 +225,7 @@ int Wireless::send(WirelessFrame *frame)
 
 bool Wireless::begin()
 {
-  if (setupDone)
+  if (setupDone.load(std::memory_order_acquire))
   {
     return true;
   }
@@ -310,26 +266,15 @@ bool Wireless::begin()
                               int len)
                            { Wireless::getInstance()->recvCallback(mac_addr, data, static_cast<uint16_t>(len)); });
 
-  esp_now_peer_info_t broadcastPeer{};
-  const TransportAddress broadcast = broadcastAddress();
-  memcpy(broadcastPeer.peer_addr, broadcast.data(), broadcast.length);
-  broadcastPeer.channel = ESP_NOW_CHANNEL;
-  broadcastPeer.encrypt = false;
-  broadcastPeer.ifidx = WIFI_IF_STA;
-  esp_err_t broadcastAddErr = esp_now_add_peer(&broadcastPeer);
-  broadcastPeerConfigured_ = (broadcastAddErr == ESP_OK || broadcastAddErr == ESP_ERR_ESPNOW_EXIST);
-  if (!broadcastPeerConfigured_)
-  {
-    Serial.printf("Failed to add broadcast peer, error: %d\n", broadcastAddErr);
-  }
+  broadcastPeerConfigured_ = ensurePeerRegistered(broadcastAddress().data());
 
-  setupDone = true;
+  setupDone.store(true, std::memory_order_release);
   return true;
 }
 
 void Wireless::end()
 {
-  if (setupDone)
+  if (setupDone.load(std::memory_order_acquire))
   {
     if (broadcastPeerConfigured_)
     {
@@ -345,7 +290,7 @@ void Wireless::end()
       vQueueDelete(incomingQueue_);
       incomingQueue_ = nullptr;
     }
-    setupDone = false;
+    setupDone.store(false, std::memory_order_release);
   }
   receiveCb = ReceiveCallback{};
   onReceiveOtherCb = {};
@@ -354,7 +299,7 @@ void Wireless::end()
 
 bool Wireless::isReady() const
 {
-  return setupDone;
+  return setupDone.load(std::memory_order_acquire);
 }
 
 TransportAddress Wireless::localAddress() const

@@ -41,7 +41,7 @@ class Wireless : public ITransport
 private:
   static constexpr uint8_t kRxQueueDepth = 16;
   static constexpr uint8_t kAddressLength = ESP_NOW_ETH_ALEN;
-  bool setupDone = false;
+  std::atomic<bool> setupDone{false};
   bool broadcastPeerConfigured_ = false;
   QueueHandle_t incomingQueue_ = nullptr;
   std::atomic<uint32_t> droppedRxFrames_{0};
@@ -63,6 +63,7 @@ public:
   void loop() override;
 
   bool isSetupDone() const;
+  uint32_t droppedRxFrames() const { return droppedRxFrames_.load(std::memory_order_relaxed); }
 
   void sendCallback(const uint8_t *mac_addr,
                     esp_now_send_status_t status);
@@ -93,191 +94,152 @@ public:
   int sendPacket(const TransportPacket &packet, const TransportAddress &peer) override;
   void setReceiveCallback(ReceiveCallback cb) override;
 
-  // --- Typed property/event helpers (trivially copyable structs, max 250-byte payload) ---
+  // --- Typed payload helpers (trivially copyable structs, max 250-byte payload) ---
 
   template <typename T>
-  int sendProperty(uint16_t key, const T &value, const uint8_t *peer_addr)
+  int sendTyped(uint16_t type, const T &value, const uint8_t *peer_addr)
   {
-    static_assert(std::is_trivially_copyable_v<T>,
-                  "Wireless property type must be trivially copyable");
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "Wireless payload type must be trivially copyable");
     static_assert(sizeof(T) <= sizeof(TransportPacket{}.data),
-                  "Wireless property payload exceeds TransportPacket::data");
+                  "Wireless payload exceeds TransportPacket::data");
     TransportPacket pkt{};
-    pkt.type = key;
+    pkt.type = type;
     pkt.len = static_cast<uint16_t>(sizeof(T));
-    if (pkt.len > 0)
-    {
-      std::memcpy(pkt.data, &value, sizeof(T));
-    }
+    std::memcpy(pkt.data, &value, sizeof(T));
     return send(&pkt, peer_addr);
   }
 
   template <typename T>
-  int sendProperty(uint16_t key, const T &value, const TransportAddress &peer)
+  int sendTyped(uint16_t type, const T &value, const TransportAddress &peer)
   {
-    return sendProperty(key, value, peer.data());
+    return sendTyped(type, value, peer.data());
   }
 
-  template <typename T>
-  int sendEvent(uint16_t channel, const T &value, const uint8_t *peer_addr)
-  {
-    static_assert(std::is_trivially_copyable_v<T>,
-                  "Wireless event payload type must be trivially copyable");
-    static_assert(sizeof(T) <= sizeof(TransportPacket{}.data),
-                  "Wireless event payload exceeds TransportPacket::data");
-    TransportPacket pkt{};
-    pkt.type = channel;
-    pkt.len = static_cast<uint16_t>(sizeof(T));
-    if (pkt.len > 0)
-    {
-      std::memcpy(pkt.data, &value, sizeof(T));
-    }
-    return send(&pkt, peer_addr);
-  }
-
-  template <typename T>
-  int sendEvent(uint16_t channel, const T &value, const TransportAddress &peer)
-  {
-    return sendEvent(channel, value, peer.data());
-  }
-
-  int sendEvent(uint16_t channel, const uint8_t *peer_addr)
+  int sendTyped(uint16_t type, const uint8_t *peer_addr)
   {
     TransportPacket pkt{};
-    pkt.type = channel;
+    pkt.type = type;
     pkt.len = 0;
     return send(&pkt, peer_addr);
   }
 
-  int sendEvent(uint16_t channel, const TransportAddress &peer)
+  int sendTyped(uint16_t type, const TransportAddress &peer)
   {
-    return sendEvent(channel, peer.data());
+    return sendTyped(type, peer.data());
   }
 
   template <typename T>
-  static bool decodeProperty(uint16_t expectedKey, const TransportPacket &pkt, T &out)
+  static bool decodeTyped(uint16_t expectedType, const TransportPacket &pkt, T &out)
   {
-    static_assert(std::is_trivially_copyable_v<T>,
-                  "Wireless property type must be trivially copyable");
-    if (pkt.type != expectedKey || pkt.len != sizeof(T))
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "Wireless payload type must be trivially copyable");
+    if (pkt.type != expectedType || pkt.len != sizeof(T))
     {
       return false;
     }
-    if (sizeof(T) > 0)
-    {
-      std::memcpy(&out, pkt.data, sizeof(T));
-    }
+    std::memcpy(&out, pkt.data, sizeof(T));
     return true;
   }
 
   template <typename T>
-  static bool decodeProperty(uint16_t expectedKey, const WirelessFrame &frame, T &out)
+  static bool decodeTyped(uint16_t expectedType, const WirelessFrame &frame, T &out)
   {
-    return decodeProperty(expectedKey, frame.packet, out);
+    return decodeTyped(expectedType, frame.packet, out);
   }
 
   template <typename T>
-  static bool decodeProperty(uint16_t expectedKey, const WirelessFrame *frame, T &out)
+  static bool decodeTyped(uint16_t expectedType, const WirelessFrame *frame, T &out)
   {
-    return frame != nullptr && decodeProperty(expectedKey, frame->packet, out);
+    return frame != nullptr && decodeTyped(expectedType, frame->packet, out);
+  }
+
+  static bool decodeTyped(uint16_t expectedType, const TransportPacket &pkt)
+  {
+    return pkt.type == expectedType && pkt.len == 0;
+  }
+
+  static bool decodeTyped(uint16_t expectedType, const WirelessFrame &frame)
+  {
+    return decodeTyped(expectedType, frame.packet);
+  }
+
+  static bool decodeTyped(uint16_t expectedType, const WirelessFrame *frame)
+  {
+    return frame != nullptr && decodeTyped(expectedType, frame->packet);
   }
 
   template <typename T>
-  static bool decodeEvent(uint16_t expectedChannel, const TransportPacket &pkt, T &out)
-  {
-    static_assert(std::is_trivially_copyable_v<T>,
-                  "Wireless event payload type must be trivially copyable");
-    if (pkt.type != expectedChannel || pkt.len != sizeof(T))
-    {
-      return false;
-    }
-    if (sizeof(T) > 0)
-    {
-      std::memcpy(&out, pkt.data, sizeof(T));
-    }
-    return true;
-  }
-
-  template <typename T>
-  static bool decodeEvent(uint16_t expectedChannel, const WirelessFrame &frame, T &out)
-  {
-    return decodeEvent(expectedChannel, frame.packet, out);
-  }
-
-  template <typename T>
-  static bool decodeEvent(uint16_t expectedChannel, const WirelessFrame *frame, T &out)
-  {
-    return frame != nullptr && decodeEvent(expectedChannel, frame->packet, out);
-  }
-
-  static bool decodeEvent(uint16_t expectedChannel, const TransportPacket &pkt)
-  {
-    return pkt.type == expectedChannel && pkt.len == 0;
-  }
-
-  static bool decodeEvent(uint16_t expectedChannel, const WirelessFrame &frame)
-  {
-    return decodeEvent(expectedChannel, frame.packet);
-  }
-
-  static bool decodeEvent(uint16_t expectedChannel, const WirelessFrame *frame)
-  {
-    return frame != nullptr && decodeEvent(expectedChannel, frame->packet);
-  }
-
-  template <typename T>
-  void addOnReceiveProperty(uint16_t key, std::function<void(const uint8_t *mac, const T &)> cb)
+  void addOnReceiveTyped(uint16_t type, std::function<void(const uint8_t *mac, const T &)> cb)
   {
     if (!cb)
     {
       return;
     }
-    addOnReceiveFor(key, [cb = std::move(cb), key](WirelessFrame *frame)
-                     {
-                       T value{};
-                       if (!decodeProperty(key, frame->packet, value))
-                       {
-                         return;
-                       }
-                       cb(frame->mac, value);
-                     });
-  }
-
-  template <typename T>
-  void addOnReceiveEvent(uint16_t channel, std::function<void(const uint8_t *mac, const T &)> cb)
-  {
-    if (!cb)
-    {
-      return;
-    }
-    addOnReceiveFor(channel, [cb = std::move(cb), channel](WirelessFrame *frame)
+    addOnReceiveFor(type, [cb = std::move(cb), type](WirelessFrame *frame)
+                    {
+                      T value{};
+                      if (decodeTyped(type, frame->packet, value))
                       {
-                        T value{};
-                        if (!decodeEvent(channel, frame->packet, value))
-                        {
-                          return;
-                        }
                         cb(frame->mac, value);
-                      });
+                      }
+                    });
   }
 
-  void addOnReceiveEvent(uint16_t channel, std::function<void(const uint8_t *mac)> cb)
+  void addOnReceiveTyped(uint16_t type, std::function<void(const uint8_t *mac)> cb)
   {
     if (!cb)
     {
       return;
     }
-    addOnReceiveFor(channel, [cb = std::move(cb), channel](WirelessFrame *frame)
-                     {
-                       if (!decodeEvent(channel, frame->packet))
-                       {
-                         return;
-                       }
-                       cb(frame->mac);
-                     });
+    addOnReceiveFor(type, [cb = std::move(cb), type](WirelessFrame *frame)
+                    {
+                      if (decodeTyped(type, frame->packet))
+                      {
+                        cb(frame->mac);
+                      }
+                    });
   }
+
+  // ---- Backward-compatible aliases (property/event vocabulary) ----
+
+  template <typename T>
+  int sendProperty(uint16_t key, const T &value, const uint8_t *peer_addr) { return sendTyped(key, value, peer_addr); }
+  template <typename T>
+  int sendProperty(uint16_t key, const T &value, const TransportAddress &peer) { return sendTyped(key, value, peer); }
+
+  template <typename T>
+  int sendEvent(uint16_t channel, const T &value, const uint8_t *peer_addr) { return sendTyped(channel, value, peer_addr); }
+  template <typename T>
+  int sendEvent(uint16_t channel, const T &value, const TransportAddress &peer) { return sendTyped(channel, value, peer); }
+  int sendEvent(uint16_t channel, const uint8_t *peer_addr) { return sendTyped(channel, peer_addr); }
+  int sendEvent(uint16_t channel, const TransportAddress &peer) { return sendTyped(channel, peer); }
+
+  template <typename T>
+  static bool decodeProperty(uint16_t expectedKey, const TransportPacket &pkt, T &out) { return decodeTyped(expectedKey, pkt, out); }
+  template <typename T>
+  static bool decodeProperty(uint16_t expectedKey, const WirelessFrame &frame, T &out) { return decodeTyped(expectedKey, frame, out); }
+  template <typename T>
+  static bool decodeProperty(uint16_t expectedKey, const WirelessFrame *frame, T &out) { return decodeTyped(expectedKey, frame, out); }
+
+  template <typename T>
+  static bool decodeEvent(uint16_t expectedChannel, const TransportPacket &pkt, T &out) { return decodeTyped(expectedChannel, pkt, out); }
+  template <typename T>
+  static bool decodeEvent(uint16_t expectedChannel, const WirelessFrame &frame, T &out) { return decodeTyped(expectedChannel, frame, out); }
+  template <typename T>
+  static bool decodeEvent(uint16_t expectedChannel, const WirelessFrame *frame, T &out) { return decodeTyped(expectedChannel, frame, out); }
+  static bool decodeEvent(uint16_t expectedChannel, const TransportPacket &pkt) { return decodeTyped(expectedChannel, pkt); }
+  static bool decodeEvent(uint16_t expectedChannel, const WirelessFrame &frame) { return decodeTyped(expectedChannel, frame); }
+  static bool decodeEvent(uint16_t expectedChannel, const WirelessFrame *frame) { return decodeTyped(expectedChannel, frame); }
+
+  template <typename T>
+  void addOnReceiveProperty(uint16_t key, std::function<void(const uint8_t *mac, const T &)> cb) { addOnReceiveTyped<T>(key, std::move(cb)); }
+  template <typename T>
+  void addOnReceiveEvent(uint16_t channel, std::function<void(const uint8_t *mac, const T &)> cb) { addOnReceiveTyped<T>(channel, std::move(cb)); }
+  void addOnReceiveEvent(uint16_t channel, std::function<void(const uint8_t *mac)> cb) { addOnReceiveTyped(channel, std::move(cb)); }
 
 private:
   Wireless();
+  bool ensurePeerRegistered(const uint8_t *peer_addr);
   std::atomic<esp_now_send_status_t> lastStatus_{ESP_NOW_SEND_FAIL};
 };

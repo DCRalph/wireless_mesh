@@ -225,6 +225,12 @@ namespace
 
     return offset == frame.payloadLen;
   }
+
+  uint32_t nonZeroRandom()
+  {
+    const uint32_t r = esp_random();
+    return r == 0 ? 1u : r;
+  }
 } // namespace
 
 // ============================================================
@@ -1952,13 +1958,13 @@ uint32_t SyncManager::generateDeviceId()
       return providedId;
     }
   }
-  const uint32_t randomId = esp_random();
-  return randomId == 0 ? 1u : randomId;
+  return nonZeroRandom();
 }
 
 uint32_t SyncManager::generateGroupId()
 {
-  return random(1, UINT32_MAX);
+  // Arduino random() is signed long — only 31 bits. Use esp_random() for the full range.
+  return nonZeroRandom();
 }
 
 std::string SyncManager::addressToString(const TransportAddress &address) const

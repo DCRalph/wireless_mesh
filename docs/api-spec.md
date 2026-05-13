@@ -447,6 +447,139 @@ ping.onEvent([](uint32_t from) {
 ping.emit();
 ```
 
+## `DirectComms`
+
+`DirectComms` is a transport-agnostic layer that exchanges typed structs between two devices over any `ITransport`. It addresses peers by `TransportAddress` (with raw-MAC convenience overloads on the typed handles) and does not require a mesh group. See [direct.md](direct.md) for framing, design notes, and the coexistence pattern with `SyncManager`.
+
+#### `static DirectComms *getInstance();`
+
+- Returns the singleton direct-comms instance.
+
+#### `void setTransport(ITransport *transport);`
+
+- Sets the transport used for sending direct frames. Required before `sendTo()` / `request()`.
+- Does NOT touch the transport's `setReceiveCallback`.
+
+#### `ITransport *getTransport() const;`
+
+- Returns the configured transport pointer, or `nullptr` if not yet set.
+
+#### `bool begin(ITransport *transport);`
+
+- Convenience wiring: `setTransport(transport)` AND `transport->setReceiveCallback(receiveCallback())`.
+- Use this when no other layer is installed on the transport's `setReceiveCallback` (e.g. when `SyncManager` is NOT also active on the same transport).
+- Returns `false` only if `transport` is `nullptr`.
+
+#### `void end();`
+
+- Clears any pending RPC entries. Does not touch the transport's receive callback.
+
+#### `void loop();`
+
+- Walks the pending-RPC table once and fires `onResult(false, Resp{})` for any expired entry.
+- Call this from your Arduino `loop()`.
+
+#### `ITransport::ReceiveCallback receiveCallback();`
+
+- Returns a `ReceiveCallback` that decodes direct frames and dispatches to registered handlers.
+- Wire it however suits your setup: `transport->setReceiveCallback(direct->receiveCallback())`, or chain it through your own demuxer for coexistence with another consumer of `setReceiveCallback`.
+- The returned callable captures `this` by pointer; do not retain it past `DirectComms` lifetime.
+
+#### `template <typename T> DirectChannel<T> channel(uint16_t channelId);`
+
+- Returns a typed handle for fire-and-forget direct sends on `channelId`.
+- `T` must be trivially copyable and at most `DirectFraming::kMaxPayloadSize` (244) bytes; both checks are compile-time `static_assert`s.
+
+#### `template <typename Req, typename Resp> DirectRpc<Req, Resp> rpc(uint16_t channelId);`
+
+- Returns a typed handle for request/response RPC on `channelId`.
+- Both `Req` and `Resp` must be trivially copyable and within the 244-byte limit.
+
+```cpp
+ITransport *transport = Wireless::getInstance();
+transport->begin();
+
+DirectComms *direct = DirectComms::getInstance();
+direct->begin(transport);   // standalone wiring
+
+struct Reading { uint32_t seq; float tempC; };
+auto reading = direct->channel<Reading>(0x4001);
+reading.onReceive([](const TransportAddress &peer, const Reading &r) {
+  Serial.printf("seq=%lu temp=%.2f\n",
+                static_cast<unsigned long>(r.seq), r.tempC);
+});
+
+uint8_t peerMac[6] = { 0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC };
+reading.sendTo(peerMac, Reading{1, 22.5f});
+```
+
+## `DirectChannel<T>`
+
+#### `bool sendTo(const TransportAddress &peer, const T &value) const;`
+
+- Sends `value` to `peer`.
+- Returns `true` if the transport accepted the submit (`sendPacket` returned 0), `false` otherwise.
+- Returning `true` does not imply remote receipt — use `DirectRpc` for confirmed delivery.
+
+#### `bool sendTo(const uint8_t *peerMac, const T &value) const;`
+
+- Convenience overload that wraps a 6-byte MAC via `TransportAddress::fromMac()`.
+
+#### `void onReceive(std::function<void(const TransportAddress &peer, const T &value)> cb) const;`
+
+- Registers the callback for incoming frames on this channel.
+- Re-registering replaces the existing handler; passing an empty callback clears it.
+
+#### `uint16_t channelId() const;`
+
+- Returns the channel ID bound to the handle.
+
+#### `bool valid() const;`
+
+- Returns whether the handle is bound to a `DirectComms` instance.
+
+## `DirectRpc<Req, Resp>`
+
+#### `bool request(const TransportAddress &peer, const Req &req, uint32_t timeoutMs, std::function<void(bool ok, const Resp &resp)> onResult) const;`
+
+- Sends `req` to `peer` and arms a timeout.
+- The callback fires exactly once: `(true, decodedResp)` on reply or `(false, Resp{})` on timeout / immediate send failure.
+- Returns `false` only if the transport refused the initial submit (in which case the callback has already been invoked with `(false, Resp{})`).
+
+#### `bool request(const uint8_t *peerMac, const Req &req, uint32_t timeoutMs, std::function<void(bool ok, const Resp &resp)> onResult) const;`
+
+- Convenience overload that wraps a 6-byte MAC via `TransportAddress::fromMac()`.
+
+#### `void onRequest(std::function<bool(const TransportAddress &peer, const Req &req, Resp &outResp)> handler) const;`
+
+- Registers the responder handler.
+- The handler fills `outResp` and returns `true` to send the response, `false` to drop the request silently.
+
+#### `uint16_t channelId() const;`
+
+- Returns the channel ID.
+
+#### `bool valid() const;`
+
+- Returns whether the handle is bound to a `DirectComms` instance.
+
+```cpp
+struct PingReq  { uint32_t seq; };
+struct PingResp { uint32_t seq; uint32_t respMs; };
+
+auto ping = direct->rpc<PingReq, PingResp>(0x5001);
+ping.onRequest([](const TransportAddress &peer, const PingReq &req, PingResp &resp) {
+  resp.seq = req.seq;
+  resp.respMs = millis();
+  return true;
+});
+ping.request(peerMac, PingReq{42}, /*timeoutMs=*/200,
+             [](bool ok, const PingResp &resp) {
+               Serial.printf(ok ? "rtt ok seq=%lu\n" : "timeout seq=%lu\n",
+                             static_cast<unsigned long>(resp.seq));
+             });
+```
+
 ## Ingress and security notes
 
 - Discovery and group-management traffic is not cryptographically authenticated.

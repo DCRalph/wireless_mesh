@@ -11,12 +11,21 @@
     "email": "me@williamgiles.co.nz",
     "url": "https://github.com/dcralph"
   },
-  "version": "1.0.2",
+  "version": "1.1.0",
   "examples": "examples/*/*.ino",
   "frameworks": "arduino",
   "platforms": [
     "atmelavr",
     "espressif8266",
     "espressif32"
-  ]
+  ],
+  "build": {
+    "unflags": [
+      "-std=gnu++11",
+      "-std=gnu++14"
+    ],
+    "flags": [
+      "-std=gnu++17"
+    ]
+  }
 }
