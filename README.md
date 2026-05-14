@@ -70,7 +70,11 @@ void loop() {
 
 - Arduino library metadata is included via `library.properties`.
 - PlatformIO metadata is included via `library.json`.
-- The `examples/` directory contains `DirectPing`, `DirectRpc`, and `DirectAndMesh` sketches demonstrating `DirectComms` and its coexistence with `SyncManager`.
+- The `examples/` directory contains:
+  - `DirectPing`, `DirectRpc`, `DirectAndMesh` — `DirectComms` point-to-point and request/response, plus coexistence with `SyncManager`.
+  - `MeshMaster` / `MeshSlave` — explicit master/slave pair using `SyncMode::HOST` and `SyncMode::JOIN`, with bidirectional properties and a void event.
+  - `MeshAuto` — identical firmware on every board; `SyncMode::AUTO` elects a master and forms a group automatically.
+  - `MeshEvents` — fire-and-forget mesh events (typed payload and zero-payload channels).
 - **C++17 is required.** Mesh and Direct headers use `std::enable_if_t`, `std::is_void_v`, and lambda init-captures. PlatformIO ESP32 defaults to `gnu++11`, so add the following to your project's `platformio.ini`:
 
   ```ini
