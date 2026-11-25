@@ -794,6 +794,7 @@ void SyncManager::loop()
 
   checkDiscoveryCleanup(now);
   checkGroupCleanup(now);
+  purgeRejected(now);
   checkMemberTimeout(now);
   cleanupRelayCache(now);
   cleanupProperties(now);
@@ -887,6 +888,7 @@ void SyncManager::createGroup(uint32_t groupId)
   {
     return;
   }
+  ++membership_;
   currentGroup.groupId = groupId;
   currentGroup.masterDeviceId = ourDeviceId;
   currentGroup.isMaster = true;
@@ -929,9 +931,12 @@ void SyncManager::joinGroup(uint32_t groupId)
   currentGroup.isMaster = false;
   currentGroup.members.clear();
 
-  lastListedMs_ = millis();
+  ++membership_;
+  // Unconfirmed until a roster lists us; give-up counts from the join itself.
+  unlisted_ = true;
+  unlistedSinceMs_ = millis();
   joinRetryMs_ = MeshConstants::kJoinRetryMs;
-  nextJoinAtMs_ = lastListedMs_ + joinRetryMs_;
+  nextJoinAtMs_ = unlistedSinceMs_ + joinRetryMs_;
 
   // Reset sync state when joining a group (slaves need to sync)
   offsetClock_.reset();
@@ -1001,22 +1006,20 @@ void SyncManager::leaveGroup()
     return;
   }
 
+  const bool wasMaster = currentGroup.isMaster;
+  // Drop the group before sending: on a synchronous transport the master's next
+  // roster can arrive inside the send, and must not see us as a member to rejoin.
+  offsetClock_.reset();
+  currentGroup = {};
+  ++membership_;
+  propertyStore_.clearRemoteEntries(ourDeviceId);
+
   for (uint8_t attempt = 0; attempt < 3; ++attempt)
   {
     sendBroadcastPacketChecked(pkt, "group-leave");
   }
-  if (currentGroup.isMaster)
-  {
-    Serial.println("[GroupLeave] Master disbanding group, notifying all slaves");
-  }
-  else
-  {
-    Serial.println("[GroupLeave] Notified group of departure");
-  }
-
-  offsetClock_.reset();
-  currentGroup = {};
-  propertyStore_.clearRemoteEntries(ourDeviceId);
+  Serial.println(wasMaster ? "[GroupLeave] Master disbanding group, notifying all slaves"
+                           : "[GroupLeave] Notified group of departure");
 
   if (onGroupLeft)
     onGroupLeft();
@@ -1645,14 +1648,19 @@ void SyncManager::processGroupInfo(const MeshProtocol::DecodedFrame &frame, cons
   std::sort(newMemberIds.begin(), newMemberIds.end());
 
   // Only force publish when membership actually changed.
+  const uint32_t membership = membership_;
   if (oldMemberIds != newMemberIds)
   {
     reannounceProperties(millis(), true);
   }
 
   // Applied first: a synchronous transport may deliver the master's reply to the
-  // join below before this call returns.
-  checkListed(listed, millis());
+  // join below before this call returns. Listeners run by the re-announce may have
+  // moved us to another group; then this roster no longer applies.
+  if (membership_ == membership)
+  {
+    checkListed(listed, millis());
+  }
 }
 
 // A follower the master's roster leaves out (lost join, or timed out during an
@@ -1662,11 +1670,19 @@ void SyncManager::checkListed(bool listed, uint32_t now)
 {
   if (listed)
   {
-    lastListedMs_ = now;
-    joinRetryMs_ = MeshConstants::kJoinRetryMs;
+    unlisted_ = false;
     return;
   }
-  if (now - lastListedMs_ >= MeshConstants::kJoinGiveUpMs)
+  if (!unlisted_)
+  {
+    // Newly left out (for example timed out during an outage): rejoin now, and
+    // count the give-up from here, not from the last confirmation.
+    unlisted_ = true;
+    unlistedSinceMs_ = now;
+    joinRetryMs_ = MeshConstants::kJoinRetryMs;
+    nextJoinAtMs_ = now;
+  }
+  if (now - unlistedSinceMs_ >= MeshConstants::kJoinGiveUpMs)
   {
     Serial.println("[GroupJoin] Master never listed us; leaving its group");
     rejectGroup(currentGroup.groupId, now);
@@ -1681,12 +1697,17 @@ void SyncManager::checkListed(bool listed, uint32_t now)
   }
 }
 
-void SyncManager::rejectGroup(uint32_t groupId, uint32_t now)
+void SyncManager::purgeRejected(uint32_t now)
 {
   for (auto it = rejectedGroups_.begin(); it != rejectedGroups_.end();)
   {
     it = static_cast<int32_t>(now - it->second) >= 0 ? rejectedGroups_.erase(it) : std::next(it);
   }
+}
+
+void SyncManager::rejectGroup(uint32_t groupId, uint32_t now)
+{
+  purgeRejected(now);
   if (rejectedGroups_.size() < 8)
   {
     rejectedGroups_[groupId] = now + MeshConstants::kRejectedGroupMs;
@@ -1740,6 +1761,7 @@ void SyncManager::processGroupLeave(const MeshProtocol::DecodedFrame &frame, con
       offsetClock_.reset();
       uint32_t gid = currentGroup.groupId;
       currentGroup = {};
+      ++membership_;
       propertyStore_.clearRemoteEntries(ourDeviceId);
       // Remove the now-dead group from discovery
       discoveredGroups.erase(gid);
@@ -2463,14 +2485,14 @@ bool SyncManager::setPropertyBytes(uint16_t key, const uint8_t *data, uint8_t le
                                           static_cast<uint8_t>(MeshProtocol::PropertyCommand::Update),
                                           payload.data(),
                                           static_cast<uint16_t>(payload.size()));
-  const uint32_t groupId = currentGroup.groupId;
+  const uint32_t membership = membership_;
 
   // The value is committed: local listeners hear it now, and a failed send is
   // repaired by the periodic re-announce.
   const bool copied = payload.size() == sizeof(MeshProtocol::PropertyEntryHeader) + len;
   notifyPropertyChange(key, ourDeviceId, copied ? payload.data() + sizeof(MeshProtocol::PropertyEntryHeader) : data, len);
 
-  return built && currentGroup.groupId == groupId && sendBroadcastPacketChecked(pkt, "property-update");
+  return built && membership_ == membership && sendBroadcastPacketChecked(pkt, "property-update");
 }
 
 bool SyncManager::readPropertyBytes(uint16_t key, uint32_t ownerDeviceId, uint8_t *out, uint8_t cap, uint8_t &outLen) const
@@ -2667,8 +2689,8 @@ void SyncManager::processPropertyBatch(const MeshProtocol::DecodedFrame &frame, 
   }
 
   offset = 1;
-  const uint32_t groupId = currentGroup.groupId;
-  for (uint8_t i = 0; i < count && currentGroup.groupId == groupId; ++i) // a listener may leave the group
+  const uint32_t membership = membership_;
+  for (uint8_t i = 0; i < count && membership_ == membership; ++i) // a listener may leave or switch groups
   {
     MeshProtocol::PropertyEntryHeader entry{};
     const uint8_t *value = nullptr;

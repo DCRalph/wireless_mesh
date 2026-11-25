@@ -349,11 +349,26 @@ static void testMesh()
     assert(countSent(MeshProtocol::MessageKind::Property, 1) == updates);
   }
 
-  // Rejoin, then a master that never lists us is given up on and not rejoined.
+  // Rejoin. After a long roster gap, the first roster that leaves us out (the
+  // master timed us out) earns a prompt rejoin, not a give-up.
   heartbeat(kMasterId, kMasterMac, SyncMode::HOST);
   announce(kGroup, kMasterId, kMasterMac);
   mesh->loop();
   assert(mesh->isInGroup());
+  groupInfo(kMasterId, kMasterMac, {{kMasterId, kMasterMac}, {kOurId, kOurMac}});
+  for (int i = 0; i < 15; ++i)
+  {
+    heartbeat(kMasterId, kMasterMac, SyncMode::HOST);
+    announce(kGroup, kMasterId, kMasterMac);
+    advance(1000, mesh);
+  }
+  {
+    const size_t before = countSent(MeshProtocol::MessageKind::Group, 2);
+    groupInfo(kMasterId, kMasterMac, {{kMasterId, kMasterMac}});
+    assert(mesh->isInGroup() && countSent(MeshProtocol::MessageKind::Group, 2) == before + 1);
+  }
+
+  // A master that never lists us is given up on and not rejoined.
   for (uint32_t t = 0; t <= MeshConstants::kJoinGiveUpMs + 2000; t += 2000)
   {
     heartbeat(kMasterId, kMasterMac, SyncMode::HOST);

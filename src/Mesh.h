@@ -589,6 +589,7 @@ private:
   void sendGroupJoin();
   void checkListed(bool listed, uint32_t now);
   void rejectGroup(uint32_t groupId, uint32_t now);
+  void purgeRejected(uint32_t now);
   bool isRejected(uint32_t groupId, uint32_t now) const;
   bool shouldForwardRelayFrame(const MeshProtocol::DecodedFrame &frame) const;
   void forwardRelayFrame(const MeshProtocol::DecodedFrame &frame);
@@ -622,7 +623,11 @@ private:
   uint32_t lastTimeSync = 0;
   uint32_t lastTimeReq = 0;
   bool timeReqPending_ = false; // a response must answer the latest request, once
-  uint32_t lastListedMs_ = 0;   // last roster from our master that listed us
+  // Bumped on every create, join and leave, so a continuation can tell its group
+  // session ended even if the same group id was rejoined meanwhile.
+  uint32_t membership_ = 0;
+  bool unlisted_ = false;        // our master's latest roster left us out
+  uint32_t unlistedSinceMs_ = 0; // since when
   uint32_t joinRetryMs_ = MeshConstants::kJoinRetryMs;
   uint32_t nextJoinAtMs_ = 0;
   std::map<uint32_t, uint32_t> rejectedGroups_; // group id -> ignore until (millis)
