@@ -27,8 +27,8 @@ The included transport implementation is ESP32-oriented:
 - `library.properties` declares `architectures=esp32`
 - `Wireless` depends on ESP-NOW, `WiFi.h`, `esp_wifi.h`, and FreeRTOS queue support
 - the mesh layer is written against `ITransport`, so other transports could be added later, but they are not included here
-
-`library.json` currently lists broader platforms than the code realistically supports. For this repository as it exists today, the safe expectation is ESP32 with Arduino.
+- builds on arduino-esp32 2.x (ESP-IDF 4.4) and 3.x (ESP-IDF 5.x); the ESP-NOW callback signatures are adapted per IDF version
+- payloads are sized for ESP-NOW v1 frames (250 bytes on air)
 
 ## Architecture
 
@@ -83,6 +83,12 @@ void loop() {
   ```
 
   Recent Arduino-ESP32 cores (3.x) already default to `gnu++17` and need no extra flags.
+
+## Tests
+
+`test/host/run.sh` builds the Direct and Mesh layers on the host with ASan and UBSan
+against a fake transport and runs their protocol cases (RPC matching, join retry,
+roster limits, property liveness, time sync). It needs a C++17 compiler only.
 
 ## License
 

@@ -26,9 +26,9 @@ Direct frames are carried inside a regular `TransportPacket` with `type = Direct
 | 1 | `channelId` | 2 | user-chosen channel |
 | 3 | `requestId` | 2 | `0` for `OneWay`; nonzero, monotonically allocated for `Request`/`Response` |
 | 5 | `payloadLen` | 1 | bytes of user payload that follow |
-| 6 | `payload` | up to 244 | trivially-copyable struct bytes |
+| 6 | `payload` | up to 240 | trivially-copyable struct bytes |
 
-`DirectFraming::kMaxPayloadSize` (244) is enforced at compile time on the typed handles via `static_assert`.
+`DirectFraming::kMaxPayloadSize` (240, one ESP-NOW frame less both headers) is enforced at compile time on the typed handles via `static_assert`.
 
 ## 3) Lifecycle
 
@@ -51,7 +51,7 @@ void loop() {
 
 - `begin(transport)` is the convenience setup: it calls `setTransport(transport)` and `transport->setReceiveCallback(receiveCallback())`.
 - Use `setTransport(transport)` alone when something else (e.g. `SyncManager`) already owns the transport's single `setReceiveCallback`. See §6.
-- `end()` clears any pending RPC entries. The transport's receive callback is owned by the caller and is not touched.
+- `end()` completes every pending RPC with `(false, Resp{})`. The transport's receive callback is owned by the caller and is not touched.
 - `DirectComms::loop()` is the only periodic work needed. It walks the pending-request table once per call and fires `onResult(false, ...)` for any expired entry.
 
 ## 4) `DirectChannel<T>` — fire-and-forget
@@ -70,7 +70,7 @@ reading.sendTo(peerMac, Reading{1, 22.5f});                  // raw-MAC convenie
 reading.sendTo(TransportAddress::fromMac(peerMac), Reading{}); // explicit form
 ```
 
-- `T` must be trivially copyable and at most 244 bytes; both checks are compile-time `static_assert`s.
+- `T` must be trivially copyable and at most 240 bytes; both checks are compile-time `static_assert`s.
 - `sendTo()` returns `false` only if the transport refused the submit (returns nonzero from `sendPacket`). For ESP-NOW that means "submitted to the radio", not "the peer received it" — use `DirectRpc` for round-trip confirmation.
 - `onReceive()` runs on whatever thread your transport drains receive frames on (for the included `Wireless` transport, that's the Arduino loop thread inside `Wireless::loop()`).
 - Re-registering on the same channel replaces the existing handler. Passing an empty `std::function` clears it.
@@ -105,11 +105,12 @@ ping.request(peerMac, PingReq{42}, /*timeoutMs=*/200,
 
 Behavior:
 
-- `request()` allocates a 16-bit `requestId` (skips zero), sends a `Request` frame, and stores the callback with a deadline of `millis() + timeoutMs`.
-- An incoming `Response` frame matching the `requestId` and `channelId` fires the callback with `(true, decodedResp)` and removes the entry.
+- `request()` allocates a 16-bit `requestId` (skipping zero and ids still pending), stores the callback with a deadline of `millis() + timeoutMs` (timeouts cap at `kMaxTimeoutMs`, about 24 days), then sends a `Request` frame. Storing first lets a synchronous transport deliver the reply from inside the send.
+- An incoming `Response` frame matching the `requestId` and `channelId`, from the peer that was asked, fires the callback with `(true, decodedResp)` and removes the entry. A request sent to the broadcast address accepts the first reply from anyone.
+- A response that arrives after its deadline, even one drained before `loop()` ran, fires `(false, Resp{})`.
 - `DirectComms::loop()` removes any expired entry and fires `(false, Resp{})`.
 - If the radio refuses the initial submit, `request()` fires `(false, Resp{})` immediately and returns `false`. No pending entry is kept.
-- Late responses (arriving after the timeout fired) are silently dropped because the entry has already been removed.
+- `DirectComms::end()` fires `(false, Resp{})` for every pending request.
 - The callback fires exactly once per `request()` call.
 
 Responder semantics:

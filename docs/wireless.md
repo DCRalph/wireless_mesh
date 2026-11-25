@@ -31,13 +31,13 @@ Packed transport payload container:
 |---|---|---|
 | `type` | `uint16_t` | Application- or protocol-defined packet type |
 | `len` | `uint16_t` | Number of valid bytes in `data` |
-| `data` | `uint8_t[250]` | Transport payload buffer |
+| `data` | `uint8_t[TransportPacket::kMaxData]` | Transport payload buffer (246 bytes) |
 
 Important limits:
 
-- The transport payload buffer is 250 bytes.
-- Mesh uses only part of that budget because it adds its own frame header and internal limits.
-- `Wireless::recvCallback()` rejects incoming packets whose declared `len` exceeds `data[250]` or whose on-air length is shorter than `sizeof(type) + sizeof(len) + len`.
+- ESP-NOW v1 carries at most 250 bytes per frame (`ESP_NOW_MAX_DATA_LEN`). The 4-byte `type` + `len` header leaves `TransportPacket::kMaxData` = 246 bytes of data. Direct and mesh derive their limits from it.
+- `send()` rejects packets whose `len` exceeds `kMaxData` instead of truncating them.
+- `Wireless::recvCallback()` drops frames whose on-air length is not exactly `4 + len`.
 
 ### `ITransport`
 
@@ -87,44 +87,43 @@ The mesh layer does not depend on ESP-NOW-specific APIs directly. Any alternativ
    - temporarily enables promiscuous mode
    - sets the radio channel to `ESP_NOW_CHANNEL`
    - disables promiscuous mode again
-3. Calls `esp_now_init()`.
-4. Creates the RX queue if needed.
+3. Creates the RX queue on first use and empties it.
    - queue depth is `Wireless::kRxQueueDepth`, currently `16`
-5. Resets the dropped-frame counter.
-6. Registers ESP-NOW send and receive callback trampolines that dispatch through `Wireless::getInstance()`.
-7. Adds the transport broadcast peer returned by `broadcastAddress()` on `WIFI_IF_STA`, with `encrypt = false`.
+4. Resets the dropped-frame counter and calls `esp_now_init()`.
+5. Registers ESP-NOW send and receive callback trampolines that dispatch through `Wireless::getInstance()`. They adapt to the ESP-IDF 4.4, 5.0 and 5.5 callback signatures, so the library builds on arduino-esp32 2.x and 3.x.
+6. Adds the broadcast peer on `WIFI_IF_STA`, with `encrypt = false`.
 
-If queue creation fails, `begin()` deinitializes ESP-NOW and returns `false`.
+If any step fails, `begin()` deinitializes ESP-NOW and returns `false`.
 
 ### `end()`
 
 `Wireless::end()`:
 
-- removes the transport broadcast peer if it was configured
-- unregisters ESP-NOW callbacks
-- deinitializes ESP-NOW
-- deletes the RX queue
-- clears registered receive callbacks
-- clears the setup flag
+- clears the setup flag first, so in-flight Wi-Fi callbacks stop queueing and `loop()` stops dispatching (safe to call from a receive handler)
+- unregisters ESP-NOW callbacks and deinitializes ESP-NOW, which drops the peer table
+- empties the RX queue; the queue itself is kept for the next `begin()`
+
+Registered receive callbacks (`setReceiveCallback`, `addOnReceiveFor`, `setOnReceiveOther`) survive `end()`, so `end()` then `begin()` needs no rewiring.
 
 ## 4) Receive path
 
 ESP-NOW receive callbacks run through `Wireless::recvCallback()`:
 
-- ignores frames if the queue is missing
-- requires at least enough bytes for `type` and `len`
-- validates declared payload length
+- ignores frames while the transport is down
+- requires the on-air length to be exactly `4 + len`, at most 250 bytes
 - copies the packet and source MAC into a `WirelessFrame`
 - pushes that frame into the FreeRTOS queue
 - increments `droppedRxFrames_` if the queue is full
 
-`Wireless::loop()` drains that queue and dispatches received frames in this order:
+`Wireless::loop()` drains up to one queue's worth (16 frames) per call, so a busy sender cannot hold the caller's loop, and dispatches each frame in this order:
 
 1. If `receiveCb` is set, converts the source ESP-NOW MAC into `TransportAddress` and invokes the generic transport callback.
 2. If a type-specific callback exists in `onReceiveForCallbacks`, invokes it.
 3. Otherwise, if `onReceiveOtherCb` is set, invokes the generic fallback callback.
 
-This matters because `SyncManager` uses the generic `ReceiveCallback`, while applications that use `Wireless` directly can also register packet-type handlers.
+This matters because `SyncManager` uses the generic `ReceiveCallback`, while applications that use `Wireless` directly can also register packet-type handlers. A handler may replace or remove its own registration, or call `end()`, while it runs.
+
+`Wireless` is not thread-safe: call `send*()` and `loop()` from one task.
 
 ## 5) Send path
 
@@ -139,13 +138,13 @@ This matters because `SyncManager` uses the generic `ReceiveCallback`, while app
 
 Current send behavior:
 
-- Returns `-1` if the transport is not initialized.
+- Returns `-1` if the transport is not initialized, the packet is too long, or ESP-NOW refuses it. Error logs print only with `DEBUG_ESP_NOW=1`.
 - Address-based sends require `peer.length == ESP_NOW_ETH_ALEN`; otherwise the send is rejected.
-- Non-broadcast sends use an ephemeral peer pattern:
-  - if the peer is not already registered, `Wireless` adds it with `esp_now_add_peer()`
-  - sends the packet with `esp_now_send()`
-  - removes that peer after send completes or after a send failure
-- Broadcast sends compare against `broadcastAddress()` and use the preconfigured broadcast peer without removing it afterward.
+- Unicast peers stay registered in an 18-entry LRU (the ESP-NOW table holds about 20, one is the broadcast peer):
+  - a new peer is added with `esp_now_add_peer()`; when the LRU is full, or ESP-NOW reports the table full, the least recently used peer this class added is deleted first
+  - a peer that something else registered is used but never cached or deleted
+  - a cached peer deleted behind the class's back is re-added on next use
+- Broadcast sends use the broadcast peer added in `begin()`.
 - `send(WirelessFrame *frame)` only sends frames whose direction is `PacketDirection::SEND`.
 
 `sendPacket()` is the `ITransport` entry point and simply forwards to the transport’s packet send helper.
@@ -185,7 +184,7 @@ These are transport-level conveniences and are separate from mesh-level property
 These helpers:
 
 - require trivially copyable payload types
-- are limited to the 250-byte `TransportPacket::data` capacity
+- are limited to `TransportPacket::kMaxData` (246) bytes
 - operate on raw transport packet types and channels
 - can be useful for direct `Wireless` applications outside the mesh protocol
 

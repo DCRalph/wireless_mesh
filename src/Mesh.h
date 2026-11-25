@@ -6,6 +6,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -22,11 +23,14 @@ namespace MeshConstants
   constexpr uint16_t kMeshPacketType = 0xBEEF;
   constexpr uint8_t kProtocolVersion = 2;
   constexpr uint8_t kFlagNoRelay = 0x01;
-  constexpr uint16_t kMaxMeshPayload = 235;
-  constexpr uint8_t kMaxEventPayloadSize = 232; // kMaxMeshPayload - sizeof(EventHeader)
+  // Sizes follow from one ESP-NOW frame; static_asserts below tie them to the headers.
+  constexpr uint16_t kFrameHeaderSize = 15;                                  // FrameHeader
+  constexpr uint16_t kMaxMeshPayload = TransportPacket::kMaxData - kFrameHeaderSize; // 231
+  constexpr uint8_t kMaxEventPayloadSize = kMaxMeshPayload - 3;              // EventHeader: 228
+  // Must fit a property batch too: count byte + PropertyEntryHeader. 225.
+  constexpr uint8_t kMaxPropertyValueSize = kMaxMeshPayload - 1 - 5;
 
   // Property store
-  constexpr uint8_t kMaxPropertyValueSize = 230;
   constexpr uint16_t kMaxPropertyEntries = 200;
   constexpr uint32_t kPropertyReannounceIntervalMs = 5000;
   constexpr uint32_t kPropertyCleanupIntervalMs = 10000;
@@ -39,6 +43,12 @@ namespace MeshConstants
   constexpr uint32_t kGroupDiscoveryTimeout = 6000;
   constexpr uint32_t kGroupInfoInterval = 2000;
   constexpr uint32_t kGroupMemberTimeout = 8000;
+  // A roster is one frame: 9-byte header + 11 bytes per member with a 6-byte address.
+  constexpr uint8_t kMaxGroupMembers = (kMaxMeshPayload - 9) / 11; // 20
+  constexpr uint32_t kJoinRetryMs = 1000;
+  // Discovery tables are fed by any radio in range; cap them.
+  constexpr size_t kMaxDiscoveredDevices = 32;
+  constexpr size_t kMaxDiscoveredGroups = 16;
   /// Base for AUTO-mode group IDs; actual ID is kAutoGroupId | (random 16 bits) when creating.
   constexpr uint32_t kAutoGroupId = 0xA1100000u;
   constexpr uint32_t kAutoGroupIdMask = 0xFFFF0000u;
@@ -124,6 +134,10 @@ namespace MeshProtocol
     uint16_t channelId;
     uint8_t payloadLen;
   };
+
+  static_assert(sizeof(FrameHeader) == MeshConstants::kFrameHeaderSize, "FrameHeader size");
+  static_assert(sizeof(EventHeader) + MeshConstants::kMaxEventPayloadSize == MeshConstants::kMaxMeshPayload, "event budget");
+  static_assert(1 + sizeof(PropertyEntryHeader) + MeshConstants::kMaxPropertyValueSize == MeshConstants::kMaxMeshPayload, "batch budget");
 
   struct DecodedFrame
   {
@@ -221,18 +235,19 @@ public:
                 const uint8_t *value,
                 uint8_t valueLen,
                 uint32_t nowMs,
-                PropertySnapshot &outSnapshot);
+                uint16_t &outRevision);
+  // A repeat of the stored revision refreshes liveness without counting as a change.
   bool applyRemote(uint16_t key,
                    uint32_t ownerDeviceId,
                    uint16_t revision,
                    const uint8_t *value,
                    uint8_t valueLen,
                    uint32_t nowMs,
-                   PropertySnapshot &outSnapshot,
                    bool &outChanged);
 
   bool has(uint16_t key, uint32_t ownerDeviceId) const;
-  bool get(uint16_t key, uint32_t ownerDeviceId, std::vector<uint8_t> &out) const;
+  // Copies up to `cap` bytes; outLen is the stored length. False if absent.
+  bool read(uint16_t key, uint32_t ownerDeviceId, uint8_t *out, uint8_t cap, uint8_t &outLen) const;
   uint16_t getRevision(uint16_t key, uint32_t ownerDeviceId) const;
   std::vector<PropertySnapshot> getAll() const;
   std::vector<PropertySnapshot> getOwnedBy(uint32_t ownerDeviceId) const;
@@ -240,6 +255,18 @@ public:
   void clearRemoteEntries(uint32_t localDeviceId);
   void removeKey(uint16_t key);
   void cleanupStale(uint32_t nowMs, uint32_t staleMs, uint32_t localDeviceId);
+
+  template <typename F>
+  void forEachOwnedBy(uint32_t ownerDeviceId, F &&fn) const
+  {
+    for (const auto &entry : entries_)
+    {
+      if (entry.ownerDeviceId == ownerDeviceId && entry.revision != 0)
+      {
+        fn(entry);
+      }
+    }
+  }
 
 private:
   PropertyEntry *findEntry(uint16_t key, uint32_t ownerDeviceId);
@@ -536,7 +563,7 @@ private:
   bool registerProperty(uint16_t key, uint8_t maxLen);
   bool registerEvent(uint16_t channelId, uint8_t maxLen);
   bool setPropertyBytes(uint16_t key, const uint8_t *data, uint8_t len);
-  bool getPropertyBytesForOwner(uint16_t key, uint32_t ownerDeviceId, std::vector<uint8_t> &out) const;
+  bool readPropertyBytes(uint16_t key, uint32_t ownerDeviceId, uint8_t *out, uint8_t cap, uint8_t &outLen) const;
   bool hasPropertyValue(uint16_t key, uint32_t ownerDeviceId) const;
   uint16_t getPropertyRevision(uint16_t key, uint32_t ownerDeviceId) const;
   void addPropertyChangeCallback(uint16_t key, std::function<void(uint32_t, const uint8_t *, uint8_t)> cb);
@@ -556,6 +583,7 @@ private:
                             uint8_t flags = 0,
                             uint8_t hopLimit = MeshConstants::kDefaultRelayHopLimit);
   bool rememberRelayFrame(uint32_t originDeviceId, uint32_t sequence, uint32_t now);
+  void sendGroupJoin();
   bool shouldForwardRelayFrame(const MeshProtocol::DecodedFrame &frame) const;
   void forwardRelayFrame(const MeshProtocol::DecodedFrame &frame);
   uint64_t relayFrameKey(uint32_t originDeviceId, uint32_t sequence) const;
@@ -587,17 +615,21 @@ private:
   OffsetClock offsetClock_;
   uint32_t lastTimeSync = 0;
   uint32_t lastTimeReq = 0;
+  bool timeReqPending_ = false; // a response must answer the latest request, once
+  uint32_t lastJoinSentMs_ = 0;
   bool started_ = false;
 
+  // shared_ptr so a listener can unregister or add listeners while being notified.
+  using ByteCallback = std::function<void(uint32_t, const uint8_t *, uint8_t)>;
   struct PropertyRegistration
   {
     uint8_t maxLen = 0;
-    std::vector<std::function<void(uint32_t, const uint8_t *, uint8_t)>> callbacks;
+    std::vector<std::shared_ptr<const ByteCallback>> callbacks;
   };
   struct EventRegistration
   {
     uint8_t maxLen = 0;
-    std::vector<std::function<void(uint32_t, const uint8_t *, uint8_t)>> callbacks;
+    std::vector<std::shared_ptr<const ByteCallback>> callbacks;
   };
   std::map<uint16_t, PropertyRegistration> propertyRegistry_;
   std::map<uint16_t, EventRegistration> eventRegistry_;
@@ -643,17 +675,18 @@ T PropertyHandle<T>::get() const
 template <typename T>
 T PropertyHandle<T>::get(uint32_t deviceId) const
 {
-  T out{};
   if (manager_ == nullptr || deviceId == 0)
   {
-    return out;
+    return T{};
   }
-  std::vector<uint8_t> bytes;
-  if (!manager_->getPropertyBytesForOwner(key_, deviceId, bytes) || bytes.size() != sizeof(T))
+  uint8_t bytes[sizeof(T)];
+  uint8_t len = 0;
+  if (!manager_->readPropertyBytes(key_, deviceId, bytes, sizeof(T), len) || len != sizeof(T))
   {
-    return out;
+    return T{};
   }
-  memcpy(&out, bytes.data(), sizeof(T));
+  T out{};
+  memcpy(&out, bytes, sizeof(T));
   return out;
 }
 

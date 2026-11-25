@@ -11,6 +11,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <type_traits>
 
 #include "ITransport.h"
@@ -36,9 +37,13 @@ struct WirelessFrame
 // ESP-NOW transport implementation
 // ============================================================
 
+// One ESP-NOW transport per device. Callbacks registered here survive end()/begin(),
+// so a radio restart needs no rewiring. Not thread-safe: send and loop from one task.
 class Wireless : public ITransport
 {
 private:
+  using FrameHandler = std::function<void(WirelessFrame *frame)>;
+
   static constexpr uint8_t kRxQueueDepth = 16;
   static constexpr uint8_t kAddressLength = ESP_NOW_ETH_ALEN;
   // ESP-NOW's peer table holds ~20 entries. The broadcast peer takes one,
@@ -47,16 +52,20 @@ private:
 
   std::atomic<bool> setupDone{false};
   bool broadcastPeerConfigured_ = false;
+  // Created once and never deleted: a Wi-Fi task callback can still be holding it
+  // while end() runs.
   QueueHandle_t incomingQueue_ = nullptr;
   std::atomic<uint32_t> droppedRxFrames_{0};
 
-  // LRU peer cache. Index 0 is least-recently-used, peerCacheSize_-1 is MRU.
+  // LRU of peers this class registered. Index 0 is least-recently-used. Peers that
+  // someone else registered are used but never cached, so they are never deleted.
   std::array<std::array<uint8_t, ESP_NOW_ETH_ALEN>, kMaxCachedPeers> peerCache_{};
   uint8_t peerCacheSize_ = 0;
 
-  std::function<void(WirelessFrame *frame)> onReceiveOtherCb;
-  std::map<uint16_t, std::function<void(WirelessFrame *frame)>> onReceiveForCallbacks;
-  ReceiveCallback receiveCb;
+  // shared_ptr so dispatch can hold a handler while it replaces or removes itself.
+  std::shared_ptr<const FrameHandler> onReceiveOtherCb;
+  std::map<uint16_t, std::shared_ptr<const FrameHandler>> onReceiveForCallbacks;
+  std::shared_ptr<const ReceiveCallback> receiveCb;
 
 public:
   static Wireless *getInstance(); // Non-owning singleton; do not delete.
@@ -73,9 +82,10 @@ public:
   bool isSetupDone() const;
   uint32_t droppedRxFrames() const { return droppedRxFrames_.load(std::memory_order_relaxed); }
 
+  // Called from the Wi-Fi task by the ESP-NOW callback trampolines.
   void sendCallback(const uint8_t *mac_addr,
                     esp_now_send_status_t status);
-  void recvCallback(const uint8_t *mac_addr, const uint8_t *data, uint16_t len);
+  void recvCallback(const uint8_t *mac_addr, const uint8_t *data, int len);
 
   // Set the generic "other" callback.
   void setOnReceiveOther(std::function<void(WirelessFrame *frame)> cb);
@@ -102,7 +112,7 @@ public:
   int sendPacket(const TransportPacket &packet, const TransportAddress &peer) override;
   void setReceiveCallback(ReceiveCallback cb) override;
 
-  // --- Typed payload helpers (trivially copyable structs, max 250-byte payload) ---
+  // --- Typed payload helpers (trivially copyable structs, at most TransportPacket::kMaxData bytes) ---
 
   template <typename T>
   int sendTyped(uint16_t type, const T &value, const uint8_t *peer_addr)
@@ -249,7 +259,8 @@ public:
 private:
   Wireless();
   bool ensurePeerRegistered(const uint8_t *peer_addr);
-  bool addPeerToEspNow(const uint8_t *peer_addr);
+  esp_err_t addPeerToEspNow(const uint8_t *peer_addr);
+  void evictLru();
   void promoteToMru(uint8_t index);
   std::atomic<esp_now_send_status_t> lastStatus_{ESP_NOW_SEND_FAIL};
 };

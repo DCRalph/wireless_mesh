@@ -472,7 +472,7 @@ ping.emit();
 
 #### `void end();`
 
-- Clears any pending RPC entries. Does not touch the transport's receive callback.
+- Completes every pending RPC with `(false, Resp{})`. Does not touch the transport's receive callback.
 
 #### `void loop();`
 
@@ -488,12 +488,12 @@ ping.emit();
 #### `template <typename T> DirectChannel<T> channel(uint16_t channelId);`
 
 - Returns a typed handle for fire-and-forget direct sends on `channelId`.
-- `T` must be trivially copyable and at most `DirectFraming::kMaxPayloadSize` (244) bytes; both checks are compile-time `static_assert`s.
+- `T` must be trivially copyable and at most `DirectFraming::kMaxPayloadSize` (240) bytes; both checks are compile-time `static_assert`s.
 
 #### `template <typename Req, typename Resp> DirectRpc<Req, Resp> rpc(uint16_t channelId);`
 
 - Returns a typed handle for request/response RPC on `channelId`.
-- Both `Req` and `Resp` must be trivially copyable and within the 244-byte limit.
+- Both `Req` and `Resp` must be trivially copyable and within the 240-byte limit.
 
 ```cpp
 ITransport *transport = Wireless::getInstance();
@@ -543,7 +543,7 @@ reading.sendTo(peerMac, Reading{1, 22.5f});
 #### `bool request(const TransportAddress &peer, const Req &req, uint32_t timeoutMs, std::function<void(bool ok, const Resp &resp)> onResult) const;`
 
 - Sends `req` to `peer` and arms a timeout.
-- The callback fires exactly once: `(true, decodedResp)` on reply or `(false, Resp{})` on timeout / immediate send failure.
+- The callback fires exactly once: `(true, decodedResp)` on a timely reply from `peer` (anyone, for a broadcast request), or `(false, Resp{})` on timeout, a late reply, immediate send failure, or `DirectComms::end()`.
 - Returns `false` only if the transport refused the initial submit (in which case the callback has already been invoked with `(false, Resp{})`).
 
 #### `bool request(const uint8_t *peerMac, const Req &req, uint32_t timeoutMs, std::function<void(bool ok, const Resp &resp)> onResult) const;`

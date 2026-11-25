@@ -5,6 +5,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -52,9 +53,11 @@ namespace DirectFraming
 
   static_assert(sizeof(Header) == 6, "DirectFraming::Header must be 6 bytes");
 
-  // Maximum user payload after the 6-byte header.
-  constexpr uint16_t kMaxPayloadSize =
-      sizeof(TransportPacket{}.data) - sizeof(Header);
+  // Maximum user payload after the 6-byte header (240 on ESP-NOW v1).
+  constexpr uint16_t kMaxPayloadSize = TransportPacket::kMaxData - sizeof(Header);
+
+  // Longest RPC timeout; deadlines are compared as signed millis() differences.
+  constexpr uint32_t kMaxTimeoutMs = 0x7FFFFFFFu;
 }
 
 class DirectComms;
@@ -101,9 +104,10 @@ class DirectRpc
 public:
   DirectRpc() = default;
 
-  // Caller side. Sends `req` to `peer` and arms a timeout.
-  // onResult fires exactly once: (true, decodedResp) on reply,
-  // or (false, Resp{}) on timeout.
+  // Caller side. Sends `req` to `peer` and arms a timeout (capped at kMaxTimeoutMs).
+  // onResult fires exactly once: (true, decodedResp) on a reply from `peer` (any
+  // peer when `peer` is the broadcast address), or (false, Resp{}) on timeout,
+  // send failure, or DirectComms::end().
   // Returns false only if the send could not be scheduled at all.
   bool request(const TransportAddress &peer,
                const Req &req,
@@ -157,9 +161,8 @@ public:
   // Returns false only if `transport` is null.
   bool begin(ITransport *transport);
 
-  // Tear down: clears any pending RPC entries. Does not touch the
-  // transport's receive callback — the caller installed it, the caller
-  // owns it.
+  // Tear down: completes every pending RPC with (false, Resp{}). Does not touch
+  // the transport's receive callback; the caller installed it, the caller owns it.
   void end();
 
   // Pumps RPC timeouts. Call from your Arduino loop().
@@ -226,6 +229,7 @@ public:
                       uint32_t timeoutMs,
                       PendingResponseCb onResult);
 
+  // An empty handler unregisters the channel.
   void registerOneWayHandler(uint16_t channelId, OneWayHandler cb);
   void registerRequestHandler(uint16_t channelId, RawRequestHandler handler);
 
@@ -243,17 +247,21 @@ private:
                  const uint8_t *payload,
                  uint8_t payloadLen);
   uint16_t allocateRequestId();
+  bool isPending(uint16_t requestId) const;
+  bool takePending(uint16_t requestId, PendingResponseCb &out);
 
   ITransport *transport_ = nullptr;
   uint16_t nextRequestId_ = 1;
 
-  std::map<uint16_t, OneWayHandler> oneWayHandlers_;
-  std::map<uint16_t, RawRequestHandler> requestHandlers_;
+  // shared_ptr so a handler can replace or remove its own registration mid-call.
+  std::map<uint16_t, std::shared_ptr<const OneWayHandler>> oneWayHandlers_;
+  std::map<uint16_t, std::shared_ptr<const RawRequestHandler>> requestHandlers_;
 
   struct PendingRequest
   {
     uint16_t requestId;
     uint16_t channelId;
+    TransportAddress peer;
     uint32_t deadlineMs;
     PendingResponseCb onResult;
   };
@@ -291,8 +299,13 @@ template <typename T>
 void DirectChannel<T>::onReceive(
     std::function<void(const TransportAddress &peer, const T &value)> cb) const
 {
-  if (comms_ == nullptr || !cb)
+  if (comms_ == nullptr)
   {
+    return;
+  }
+  if (!cb)
+  {
+    comms_->registerOneWayHandler(channelId_, {});
     return;
   }
   comms_->registerOneWayHandler(
@@ -366,8 +379,13 @@ void DirectRpc<Req, Resp>::onRequest(
                        Resp &outResp)>
         handler) const
 {
-  if (comms_ == nullptr || !handler)
+  if (comms_ == nullptr)
   {
+    return;
+  }
+  if (!handler)
+  {
+    comms_->registerRequestHandler(channelId_, {});
     return;
   }
   comms_->registerRequestHandler(
