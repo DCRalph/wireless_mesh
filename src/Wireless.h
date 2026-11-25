@@ -37,8 +37,8 @@ struct WirelessFrame
 // ESP-NOW transport implementation
 // ============================================================
 
-// One ESP-NOW transport per device. Callbacks registered here survive end()/begin(),
-// so a radio restart needs no rewiring. Not thread-safe: send and loop from one task.
+// One ESP-NOW transport per device. end() drops every registered callback; register
+// again after begin(). Not thread-safe: send and loop from one task.
 class Wireless : public ITransport
 {
 private:
@@ -260,6 +260,7 @@ private:
   Wireless();
   bool ensurePeerRegistered(const uint8_t *peer_addr);
   esp_err_t addPeerToEspNow(const uint8_t *peer_addr);
+  bool addWithRoom(const uint8_t *peer_addr, uint8_t keep);
   void evictLru();
   void promoteToMru(uint8_t index);
   std::atomic<esp_now_send_status_t> lastStatus_{ESP_NOW_SEND_FAIL};

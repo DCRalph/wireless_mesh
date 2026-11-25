@@ -102,8 +102,7 @@ If any step fails, `begin()` deinitializes ESP-NOW and returns `false`.
 - clears the setup flag first, so in-flight Wi-Fi callbacks stop queueing and `loop()` stops dispatching (safe to call from a receive handler)
 - unregisters ESP-NOW callbacks and deinitializes ESP-NOW, which drops the peer table
 - empties the RX queue; the queue itself is kept for the next `begin()`
-
-Registered receive callbacks (`setReceiveCallback`, `addOnReceiveFor`, `setOnReceiveOther`) survive `end()`, so `end()` then `begin()` needs no rewiring.
+- clears every registered receive callback (`setReceiveCallback`, `addOnReceiveFor`, `setOnReceiveOther`), even if already stopped; register them again after `begin()` (`SyncManager::begin()` reinstalls its own). A handler running at that moment finishes safely.
 
 ## 4) Receive path
 
@@ -143,7 +142,7 @@ Current send behavior:
 - Unicast peers stay registered in an 18-entry LRU (the ESP-NOW table holds about 20, one is the broadcast peer):
   - a new peer is added with `esp_now_add_peer()`; when the LRU is full, or ESP-NOW reports the table full, the least recently used peer this class added is deleted first
   - a peer that something else registered is used but never cached or deleted
-  - a cached peer deleted behind the class's back is re-added on next use
+  - a cached peer deleted behind the class's back is re-added on next use (evicting another of its own peers if the table is full)
 - Broadcast sends use the broadcast peer added in `begin()`.
 - `send(WirelessFrame *frame)` only sends frames whose direction is `PacketDirection::SEND`.
 

@@ -244,13 +244,15 @@ bool Wireless::ensurePeerRegistered(const uint8_t *peer_addr)
   {
     if (memcmp(peerCache_[i].data(), peer_addr, ESP_NOW_ETH_ALEN) == 0)
     {
-      // Re-add if something outside this class deleted it.
-      if (!esp_now_is_peer_exist(peer_addr) && addPeerToEspNow(peer_addr) != ESP_OK)
-      {
-        return false;
-      }
       promoteToMru(i);
-      return true;
+      // Re-add if something outside this class deleted it.
+      if (esp_now_is_peer_exist(peer_addr) || addWithRoom(peer_addr, 1))
+      {
+        return true;
+      }
+      // Still gone: forget it so the cache matches the driver.
+      --peerCacheSize_;
+      return false;
     }
   }
 
@@ -264,23 +266,32 @@ bool Wireless::ensurePeerRegistered(const uint8_t *peer_addr)
   {
     evictLru();
   }
-  esp_err_t err = addPeerToEspNow(peer_addr);
-  if (err == ESP_ERR_ESPNOW_FULL && peerCacheSize_ > 0)
+  if (!addWithRoom(peer_addr, 0))
   {
-    // Other ESP-NOW users hold slots; make room from our own peers and retry once.
-    evictLru();
-    err = addPeerToEspNow(peer_addr);
-  }
-  if (err != ESP_OK)
-  {
-#if DEBUG_ESP_NOW == 1
-    Serial.printf("[ESP-NOW] add peer failed: %d\n", err);
-#endif
     return false;
   }
   memcpy(peerCache_[peerCacheSize_].data(), peer_addr, ESP_NOW_ETH_ALEN);
   ++peerCacheSize_;
   return true;
+}
+
+// Adds a peer; if ESP-NOW's table is full (other users hold slots), evicts our
+// least recently used peer and retries once. `keep` MRU entries are never evicted.
+bool Wireless::addWithRoom(const uint8_t *peer_addr, uint8_t keep)
+{
+  esp_err_t err = addPeerToEspNow(peer_addr);
+  if (err == ESP_ERR_ESPNOW_FULL && peerCacheSize_ > keep)
+  {
+    evictLru();
+    err = addPeerToEspNow(peer_addr);
+  }
+#if DEBUG_ESP_NOW == 1
+  if (err != ESP_OK)
+  {
+    Serial.printf("[ESP-NOW] add peer failed: %d\n", err);
+  }
+#endif
+  return err == ESP_OK;
 }
 
 esp_err_t Wireless::addPeerToEspNow(const uint8_t *peer_addr)
@@ -390,18 +401,22 @@ bool Wireless::begin()
 
 void Wireless::end()
 {
-  if (!setupDone.load(std::memory_order_acquire))
+  if (setupDone.load(std::memory_order_acquire))
   {
-    return;
+    // Clear first so in-flight Wi-Fi callbacks stop queueing and loop() stops dispatching.
+    setupDone.store(false, std::memory_order_release);
+    esp_now_unregister_recv_cb();
+    esp_now_unregister_send_cb();
+    esp_now_deinit(); // also drops the peer table
+    broadcastPeerConfigured_ = false;
+    peerCacheSize_ = 0;
+    xQueueReset(incomingQueue_);
   }
-  // Clear first so in-flight Wi-Fi callbacks stop queueing and loop() stops dispatching.
-  setupDone.store(false, std::memory_order_release);
-  esp_now_unregister_recv_cb();
-  esp_now_unregister_send_cb();
-  esp_now_deinit(); // also drops the peer table
-  broadcastPeerConfigured_ = false;
-  peerCacheSize_ = 0;
-  xQueueReset(incomingQueue_);
+  // Registrations may capture objects the app destroys after end(); drop them.
+  // A handler running now stays alive through loop()'s own reference.
+  receiveCb = nullptr;
+  onReceiveOtherCb = nullptr;
+  onReceiveForCallbacks.clear();
 }
 
 bool Wireless::isReady() const

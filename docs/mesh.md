@@ -115,8 +115,9 @@ The transport envelope itself, including `TransportPacket`, `TransportAddress`, 
 
 Group membership:
 
-- A follower that finds itself missing from its master's roster (lost join, or timed out during an outage) sends `Join` again, at most every `kJoinRetryMs`.
-- The master caps a roster at `kMaxGroupMembers` (20), what one group-info frame can carry, and ignores further joins.
+- A follower that finds itself missing from its master's roster (lost join, or timed out during an outage) sends `Join` again, starting after `kJoinRetryMs` and doubling up to `kJoinRetryMaxMs`, with jitter so followers do not answer one roster together.
+- A follower still unlisted after `kJoinGiveUpMs` leaves and ignores that group for `kRejectedGroupMs`; JOIN and AUTO pick another group or wait.
+- The master caps a roster at `kMaxGroupMembers` (20), what one group-info frame can carry, and ignores further joins, as it does when its discovery table has no room to track the joiner.
 - Rosters are accepted only from the group's master, joins and leaves only from the device they name. These are identity checks on the device id in each frame, not authentication: any radio in range can still forge frames.
 - Relay is on by default. Every node rebroadcasts each frame once, so airtime grows with the square of the group size; turn it off with `setRelayEnabled(false)` on single-hop deployments.
 
@@ -237,7 +238,9 @@ All current mesh tunables are defined in `MeshConstants` in `src/Mesh.h`.
 | `kGroupInfoInterval` | `2000` | Group info interval |
 | `kGroupMemberTimeout` | `8000` | Group member timeout |
 | `kMaxGroupMembers` | `20` | Largest roster that fits one frame |
-| `kJoinRetryMs` | `1000` | Minimum gap between join retries |
+| `kJoinRetryMs` / `kJoinRetryMaxMs` | `1000` / `8000` | First and longest gap between join retries |
+| `kJoinGiveUpMs` | `10000` | Unlisted this long, a follower leaves the group |
+| `kRejectedGroupMs` | `60000` | How long a given-up group is ignored |
 | `kMaxDiscoveredDevices` | `32` | Discovered-device table cap |
 | `kMaxDiscoveredGroups` | `16` | Discovered-group table cap |
 | `kAutoGroupId` | `0xA1100000` | AUTO group ID base |

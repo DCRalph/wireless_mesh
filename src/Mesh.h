@@ -45,7 +45,10 @@ namespace MeshConstants
   constexpr uint32_t kGroupMemberTimeout = 8000;
   // A roster is one frame: 9-byte header + 11 bytes per member with a 6-byte address.
   constexpr uint8_t kMaxGroupMembers = (kMaxMeshPayload - 9) / 11; // 20
-  constexpr uint32_t kJoinRetryMs = 1000;
+  constexpr uint32_t kJoinRetryMs = 1000;     // first rejoin; doubles per retry
+  constexpr uint32_t kJoinRetryMaxMs = 8000;
+  constexpr uint32_t kJoinGiveUpMs = 10000;   // unlisted this long: leave the group
+  constexpr uint32_t kRejectedGroupMs = 60000; // then ignore it this long
   // Discovery tables are fed by any radio in range; cap them.
   constexpr size_t kMaxDiscoveredDevices = 32;
   constexpr size_t kMaxDiscoveredGroups = 16;
@@ -584,6 +587,9 @@ private:
                             uint8_t hopLimit = MeshConstants::kDefaultRelayHopLimit);
   bool rememberRelayFrame(uint32_t originDeviceId, uint32_t sequence, uint32_t now);
   void sendGroupJoin();
+  void checkListed(bool listed, uint32_t now);
+  void rejectGroup(uint32_t groupId, uint32_t now);
+  bool isRejected(uint32_t groupId, uint32_t now) const;
   bool shouldForwardRelayFrame(const MeshProtocol::DecodedFrame &frame) const;
   void forwardRelayFrame(const MeshProtocol::DecodedFrame &frame);
   uint64_t relayFrameKey(uint32_t originDeviceId, uint32_t sequence) const;
@@ -616,7 +622,10 @@ private:
   uint32_t lastTimeSync = 0;
   uint32_t lastTimeReq = 0;
   bool timeReqPending_ = false; // a response must answer the latest request, once
-  uint32_t lastJoinSentMs_ = 0;
+  uint32_t lastListedMs_ = 0;   // last roster from our master that listed us
+  uint32_t joinRetryMs_ = MeshConstants::kJoinRetryMs;
+  uint32_t nextJoinAtMs_ = 0;
+  std::map<uint32_t, uint32_t> rejectedGroups_; // group id -> ignore until (millis)
   bool started_ = false;
 
   // shared_ptr so a listener can unregister or add listeners while being notified.

@@ -240,12 +240,14 @@ static void testMesh()
   const size_t joins = countSent(MeshProtocol::MessageKind::Group, 2);
   assert(joins == 1);
 
-  // The master's roster leaves us out (first join lost): we join again, rate limited.
+  // The master's roster leaves us out (first join lost): we join again, with backoff.
   groupInfo(kMasterId, kMasterMac, {{kMasterId, kMasterMac}});
   assert(countSent(MeshProtocol::MessageKind::Group, 2) == joins); // within kJoinRetryMs
   fakeMillis += MeshConstants::kJoinRetryMs;
   groupInfo(kMasterId, kMasterMac, {{kMasterId, kMasterMac}});
   assert(countSent(MeshProtocol::MessageKind::Group, 2) == joins + 1);
+  groupInfo(kMasterId, kMasterMac, {{kMasterId, kMasterMac}});
+  assert(countSent(MeshProtocol::MessageKind::Group, 2) == joins + 1); // backed off
 
   // A roster from anyone but our master is ignored.
   groupInfo(kOtherId, kOtherMac, {{kOtherId, kOtherMac}, {kOurId, kOurMac}});
@@ -334,6 +336,40 @@ static void testMesh()
     inject(kMasterMac, kMasterId, MeshProtocol::MessageKind::Event, 1, b);
   }
   assert(evCalls == 1);
+
+  // A listener that leaves the group during set() does not send into the new state.
+  {
+    groupInfo(kMasterId, kMasterMac, {{kMasterId, kMasterMac}, {kOurId, kOurMac}});
+    auto mine = mesh->property<uint32_t>(0x7002);
+    uint32_t heard = 0;
+    mine.onChange([&](uint32_t, uint32_t v) { heard = v; mesh->leaveGroup(); });
+    const size_t updates = countSent(MeshProtocol::MessageKind::Property, 1);
+    mine.set(99);
+    assert(heard == 99 && !mesh->isInGroup());
+    assert(countSent(MeshProtocol::MessageKind::Property, 1) == updates);
+  }
+
+  // Rejoin, then a master that never lists us is given up on and not rejoined.
+  heartbeat(kMasterId, kMasterMac, SyncMode::HOST);
+  announce(kGroup, kMasterId, kMasterMac);
+  mesh->loop();
+  assert(mesh->isInGroup());
+  for (uint32_t t = 0; t <= MeshConstants::kJoinGiveUpMs + 2000; t += 2000)
+  {
+    heartbeat(kMasterId, kMasterMac, SyncMode::HOST);
+    announce(kGroup, kMasterId, kMasterMac);
+    groupInfo(kMasterId, kMasterMac, {{kMasterId, kMasterMac}});
+    advance(2000, mesh);
+  }
+  assert(!mesh->isInGroup());
+  const size_t joinsAfter = countSent(MeshProtocol::MessageKind::Group, 2);
+  for (int i = 0; i < 5; ++i)
+  {
+    heartbeat(kMasterId, kMasterMac, SyncMode::HOST);
+    announce(kGroup, kMasterId, kMasterMac);
+    advance(1000, mesh);
+  }
+  assert(!mesh->isInGroup() && countSent(MeshProtocol::MessageKind::Group, 2) == joinsAfter);
 
   // As master, the roster stops at what one frame can carry and keeps going out.
   mesh->leaveGroup();

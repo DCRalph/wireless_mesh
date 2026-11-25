@@ -929,6 +929,10 @@ void SyncManager::joinGroup(uint32_t groupId)
   currentGroup.isMaster = false;
   currentGroup.members.clear();
 
+  lastListedMs_ = millis();
+  joinRetryMs_ = MeshConstants::kJoinRetryMs;
+  nextJoinAtMs_ = lastListedMs_ + joinRetryMs_;
+
   // Reset sync state when joining a group (slaves need to sync)
   offsetClock_.reset();
   currentGroup.timeSynced = offsetClock_.isLocked();
@@ -953,8 +957,7 @@ void SyncManager::joinGroup(uint32_t groupId)
   reannounceProperties(millis(), true);
 }
 
-// Sent on joining and again (at most every kJoinRetryMs) while the master's roster
-// leaves us out: the first join can be lost, or the master can time us out.
+// Sent on joining, and again from checkListed while the master's roster leaves us out.
 void SyncManager::sendGroupJoin()
 {
   const TransportAddress ourAddress = getOurAddress();
@@ -962,7 +965,6 @@ void SyncManager::sendGroupJoin()
   {
     return;
   }
-  lastJoinSentMs_ = millis();
   GroupJoinHeader joinHeader{};
   joinHeader.groupId = currentGroup.groupId;
   joinHeader.deviceId = ourDeviceId;
@@ -1515,21 +1517,23 @@ void SyncManager::processGroupAnnounce(const MeshProtocol::DecodedFrame &frame, 
   adv.masterAddress = announceCmd.masterAddress;
   adv.lastSeen = millis();
   discoveredGroups[announceCmd.groupId] = adv;
-  if (isNew && onGroupFound)
-    onGroupFound(adv);
 
   // Two AUTO partitions that meet each keep a master. Apply the election rule
-  // (lowest device id leads) across groups: the higher master hands over.
+  // (lowest device id leads) across groups: the higher master hands over. If the
+  // other group turns out full, checkListed gives up on it and we are free again.
   const auto isAutoGroup = [](uint32_t gid)
   { return (gid & MeshConstants::kAutoGroupIdMask) == MeshConstants::kAutoGroupId; };
   if (syncMode == SyncMode::AUTO && currentGroup.isMaster &&
       isAutoGroup(currentGroup.groupId) && isAutoGroup(announceCmd.groupId) &&
       announceCmd.groupId != currentGroup.groupId &&
-      announceCmd.masterDeviceId < ourDeviceId)
+      announceCmd.masterDeviceId < ourDeviceId && !isRejected(announceCmd.groupId, adv.lastSeen))
   {
     Serial.println("[AutoMode] Lower AUTO master found; merging into its group");
     joinGroup(announceCmd.groupId);
   }
+
+  if (isNew && onGroupFound)
+    onGroupFound(adv);
 }
 
 void SyncManager::processGroupJoin(const MeshProtocol::DecodedFrame &frame, const TransportAddress &)
@@ -1553,14 +1557,9 @@ void SyncManager::processGroupJoin(const MeshProtocol::DecodedFrame &frame, cons
   {
     return; // a larger roster would not fit one group-info frame
   }
-  GroupMember gm{
-      joinCmd.deviceId,
-      joinCmd.deviceAddress,
-  };
-  currentGroup.members[ms] = gm;
 
   // A join can beat the member's first heartbeat; seed liveness so the timeout
-  // sweep in this same loop does not drop it at once.
+  // sweep in this same loop does not drop it at once. No room to track it: refuse.
   auto seen = discoveredDevices.find(ms);
   if (seen != discoveredDevices.end())
   {
@@ -1570,6 +1569,16 @@ void SyncManager::processGroupJoin(const MeshProtocol::DecodedFrame &frame, cons
   {
     discoveredDevices[ms] = DiscoveredDevice{joinCmd.deviceId, joinCmd.deviceAddress, millis(), SyncMode::JOIN};
   }
+  else
+  {
+    return;
+  }
+
+  GroupMember gm{
+      joinCmd.deviceId,
+      joinCmd.deviceAddress,
+  };
+  currentGroup.members[ms] = gm;
   sendGroupInfo();
   reannounceProperties(millis(), true);
 }
@@ -1595,10 +1604,6 @@ void SyncManager::processGroupInfo(const MeshProtocol::DecodedFrame &frame, cons
   for (const GroupInfoMember &member : infoCmd.members)
   {
     listed = listed || member.deviceId == ourDeviceId;
-  }
-  if (!listed && millis() - lastJoinSentMs_ >= MeshConstants::kJoinRetryMs)
-  {
-    sendGroupJoin();
   }
 
   std::vector<uint32_t> oldMemberIds;
@@ -1644,6 +1649,54 @@ void SyncManager::processGroupInfo(const MeshProtocol::DecodedFrame &frame, cons
   {
     reannounceProperties(millis(), true);
   }
+
+  // Applied first: a synchronous transport may deliver the master's reply to the
+  // join below before this call returns.
+  checkListed(listed, millis());
+}
+
+// A follower the master's roster leaves out (lost join, or timed out during an
+// outage) joins again with backoff and jitter. A master that never lists it, such
+// as a full one, is given up on and ignored for kRejectedGroupMs.
+void SyncManager::checkListed(bool listed, uint32_t now)
+{
+  if (listed)
+  {
+    lastListedMs_ = now;
+    joinRetryMs_ = MeshConstants::kJoinRetryMs;
+    return;
+  }
+  if (now - lastListedMs_ >= MeshConstants::kJoinGiveUpMs)
+  {
+    Serial.println("[GroupJoin] Master never listed us; leaving its group");
+    rejectGroup(currentGroup.groupId, now);
+    leaveGroup();
+    return;
+  }
+  if (static_cast<int32_t>(now - nextJoinAtMs_) >= 0)
+  {
+    sendGroupJoin();
+    joinRetryMs_ = std::min<uint32_t>(joinRetryMs_ * 2, MeshConstants::kJoinRetryMaxMs);
+    nextJoinAtMs_ = now + joinRetryMs_ + esp_random() % (joinRetryMs_ / 2 + 1);
+  }
+}
+
+void SyncManager::rejectGroup(uint32_t groupId, uint32_t now)
+{
+  for (auto it = rejectedGroups_.begin(); it != rejectedGroups_.end();)
+  {
+    it = static_cast<int32_t>(now - it->second) >= 0 ? rejectedGroups_.erase(it) : std::next(it);
+  }
+  if (rejectedGroups_.size() < 8)
+  {
+    rejectedGroups_[groupId] = now + MeshConstants::kRejectedGroupMs;
+  }
+}
+
+bool SyncManager::isRejected(uint32_t groupId, uint32_t now) const
+{
+  const auto it = rejectedGroups_.find(groupId);
+  return it != rejectedGroups_.end() && static_cast<int32_t>(now - it->second) < 0;
 }
 
 void SyncManager::processGroupLeave(const MeshProtocol::DecodedFrame &frame, const TransportAddress &)
@@ -1954,11 +2007,16 @@ void SyncManager::checkJoinMode(uint32_t)
   if (currentGroup.groupId != 0)
     return;
 
-  // In JOIN mode, immediately join any discovered group
-  if (!discoveredGroups.empty())
+  // In JOIN mode, immediately join any discovered group we have not given up on.
+  const uint32_t now = millis();
+  for (const auto &kv : discoveredGroups)
   {
-    Serial.println("[JoinMode] Found group, joining immediately...");
-    joinGroup(discoveredGroups.begin()->first);
+    if (!isRejected(kv.first, now))
+    {
+      Serial.println("[JoinMode] Found group, joining immediately...");
+      joinGroup(kv.first);
+      return;
+    }
   }
 }
 
@@ -2008,7 +2066,8 @@ void SyncManager::checkAutoMode(uint32_t now)
   uint32_t discoveredAutoGroupId = 0;
   for (const auto &kv : discoveredGroups)
   {
-    if ((kv.first & MeshConstants::kAutoGroupIdMask) != MeshConstants::kAutoGroupId)
+    if ((kv.first & MeshConstants::kAutoGroupIdMask) != MeshConstants::kAutoGroupId ||
+        isRejected(kv.first, now))
     {
       continue;
     }
@@ -2394,23 +2453,24 @@ bool SyncManager::setPropertyBytes(uint16_t key, const uint8_t *data, uint8_t le
   {
     return false;
   }
+  // Build the frame from the caller's bytes before any listener runs: a listener
+  // may change them or switch groups.
+  std::vector<uint8_t> payload;
+  TransportPacket pkt{};
+  const bool built = MeshProtocol::appendPropertyEntry(payload, key, revision, data, len) &&
+                     buildLocalMeshPacket(pkt,
+                                          MeshProtocol::MessageKind::Property,
+                                          static_cast<uint8_t>(MeshProtocol::PropertyCommand::Update),
+                                          payload.data(),
+                                          static_cast<uint16_t>(payload.size()));
+  const uint32_t groupId = currentGroup.groupId;
+
   // The value is committed: local listeners hear it now, and a failed send is
   // repaired by the periodic re-announce.
-  notifyPropertyChange(key, ourDeviceId, data, len);
+  const bool copied = payload.size() == sizeof(MeshProtocol::PropertyEntryHeader) + len;
+  notifyPropertyChange(key, ourDeviceId, copied ? payload.data() + sizeof(MeshProtocol::PropertyEntryHeader) : data, len);
 
-  std::vector<uint8_t> payload;
-  if (!MeshProtocol::appendPropertyEntry(payload, key, revision, data, len))
-  {
-    return false;
-  }
-
-  TransportPacket pkt{};
-  return buildLocalMeshPacket(pkt,
-                              MeshProtocol::MessageKind::Property,
-                              static_cast<uint8_t>(MeshProtocol::PropertyCommand::Update),
-                              payload.data(),
-                              static_cast<uint16_t>(payload.size())) &&
-         sendBroadcastPacketChecked(pkt, "property-update");
+  return built && currentGroup.groupId == groupId && sendBroadcastPacketChecked(pkt, "property-update");
 }
 
 bool SyncManager::readPropertyBytes(uint16_t key, uint32_t ownerDeviceId, uint8_t *out, uint8_t cap, uint8_t &outLen) const
@@ -2607,7 +2667,8 @@ void SyncManager::processPropertyBatch(const MeshProtocol::DecodedFrame &frame, 
   }
 
   offset = 1;
-  for (uint8_t i = 0; i < count; ++i)
+  const uint32_t groupId = currentGroup.groupId;
+  for (uint8_t i = 0; i < count && currentGroup.groupId == groupId; ++i) // a listener may leave the group
   {
     MeshProtocol::PropertyEntryHeader entry{};
     const uint8_t *value = nullptr;
