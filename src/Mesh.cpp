@@ -226,6 +226,31 @@ namespace
     return offset == frame.payloadLen;
   }
 
+  // Frames with an unknown kind or command are dropped before they can use relay
+  // cache space or airtime.
+  bool isKnownCommand(MeshProtocol::MessageKind kind, uint8_t command)
+  {
+    using namespace MeshProtocol;
+    switch (kind)
+    {
+    case MessageKind::Discovery:
+      return command == static_cast<uint8_t>(DiscoveryCommand::Heartbeat);
+    case MessageKind::Group:
+      return command >= static_cast<uint8_t>(GroupCommand::Announce) &&
+             command <= static_cast<uint8_t>(GroupCommand::Leave);
+    case MessageKind::Time:
+      return command == static_cast<uint8_t>(TimeCommand::Request) ||
+             command == static_cast<uint8_t>(TimeCommand::Response);
+    case MessageKind::Property:
+      return command == static_cast<uint8_t>(PropertyCommand::Update) ||
+             command == static_cast<uint8_t>(PropertyCommand::Batch);
+    case MessageKind::Event:
+      return command == static_cast<uint8_t>(EventCommand::Emit);
+    default:
+      return false;
+    }
+  }
+
   uint32_t nonZeroRandom()
   {
     const uint32_t r = esp_random();
@@ -256,7 +281,7 @@ namespace MeshProtocol
     {
       return false;
     }
-    if (sizeof(header) + header.payloadLen > pkt.len)
+    if (pkt.len > TransportPacket::kMaxData || sizeof(header) + header.payloadLen != pkt.len)
     {
       return false;
     }
@@ -386,7 +411,7 @@ namespace MeshProtocol
       return false;
     }
     memcpy(&outHeader, payload, sizeof(outHeader));
-    if (payloadLen < sizeof(EventHeader) + outHeader.payloadLen)
+    if (payloadLen != sizeof(EventHeader) + outHeader.payloadLen)
     {
       return false;
     }
@@ -432,9 +457,9 @@ bool OffsetClock::handleSample(uint32_t requestTimestamp, uint32_t masterTimesta
     return false;
   }
 
-  const int32_t newOffset = static_cast<int32_t>(masterTimestamp) +
-                            static_cast<int32_t>(rtt / 2) -
-                            static_cast<int32_t>(nowMillis);
+  // Offsets are millis() differences, so work modulo 2^32: devices with very
+  // different uptimes must not overflow a signed expression.
+  const int32_t newOffset = static_cast<int32_t>(masterTimestamp + rtt / 2 - nowMillis);
   if (!locked_)
   {
     offsetMs_ = newOffset;
@@ -442,8 +467,9 @@ bool OffsetClock::handleSample(uint32_t requestTimestamp, uint32_t masterTimesta
     return true;
   }
 
-  // Light smoothing to reduce jitter while still tracking drift.
-  offsetMs_ = (offsetMs_ * 3 + newOffset) / 4;
+  // Light smoothing: move a quarter of the way toward the new sample.
+  const int32_t delta = static_cast<int32_t>(static_cast<uint32_t>(newOffset) - static_cast<uint32_t>(offsetMs_));
+  offsetMs_ = static_cast<int32_t>(static_cast<uint32_t>(offsetMs_) + static_cast<uint32_t>(delta / 4));
   return true;
 }
 
@@ -502,7 +528,7 @@ bool PropertyStore::setLocal(uint16_t key,
                              const uint8_t *value,
                              uint8_t valueLen,
                              uint32_t nowMs,
-                             PropertySnapshot &outSnapshot)
+                             uint16_t &outRevision)
 {
   if (valueLen > MeshConstants::kMaxPropertyValueSize || (valueLen > 0 && value == nullptr))
   {
@@ -530,11 +556,7 @@ bool PropertyStore::setLocal(uint16_t key,
     memcpy(entry->value.data(), value, valueLen);
   }
   entry->lastUpdateMs = nowMs;
-
-  outSnapshot.key = key;
-  outSnapshot.ownerDeviceId = localDeviceId;
-  outSnapshot.revision = entry->revision;
-  outSnapshot.payload.assign(entry->value.data(), entry->value.data() + entry->valueLen);
+  outRevision = entry->revision;
   return true;
 }
 
@@ -544,7 +566,6 @@ bool PropertyStore::applyRemote(uint16_t key,
                                 const uint8_t *value,
                                 uint8_t valueLen,
                                 uint32_t nowMs,
-                                PropertySnapshot &outSnapshot,
                                 bool &outChanged)
 {
   outChanged = false;
@@ -566,6 +587,11 @@ bool PropertyStore::applyRemote(uint16_t key,
     entry->ownerDeviceId = ownerDeviceId;
     outChanged = true;
   }
+  else if (revision == entry->revision)
+  {
+    entry->lastUpdateMs = nowMs; // periodic re-announce: still alive, unchanged
+    return true;
+  }
   else if (!MeshProtocol::isNewerRevision(revision, entry->revision))
   {
     return true;
@@ -582,11 +608,6 @@ bool PropertyStore::applyRemote(uint16_t key,
     memcpy(entry->value.data(), value, valueLen);
   }
   entry->lastUpdateMs = nowMs;
-
-  outSnapshot.key = key;
-  outSnapshot.ownerDeviceId = ownerDeviceId;
-  outSnapshot.revision = revision;
-  outSnapshot.payload.assign(entry->value.data(), entry->value.data() + entry->valueLen);
   return true;
 }
 
@@ -595,14 +616,19 @@ bool PropertyStore::has(uint16_t key, uint32_t ownerDeviceId) const
   return findEntry(key, ownerDeviceId) != nullptr;
 }
 
-bool PropertyStore::get(uint16_t key, uint32_t ownerDeviceId, std::vector<uint8_t> &out) const
+bool PropertyStore::read(uint16_t key, uint32_t ownerDeviceId, uint8_t *out, uint8_t cap, uint8_t &outLen) const
 {
   const PropertyEntry *entry = findEntry(key, ownerDeviceId);
   if (entry == nullptr)
   {
     return false;
   }
-  out.assign(entry->value.data(), entry->value.data() + entry->valueLen);
+  outLen = entry->valueLen;
+  const uint8_t n = std::min(entry->valueLen, cap);
+  if (n > 0 && out != nullptr)
+  {
+    memcpy(out, entry->value.data(), n);
+  }
   return true;
 }
 
@@ -752,6 +778,12 @@ void SyncManager::loop()
   {
     transport_->loop();
   }
+  // Still pump the transport (direct comms may share it), but no mesh traffic
+  // until begin() has a device id and address.
+  if (!started_)
+  {
+    return;
+  }
 
   uint32_t now = millis();
   if (now - lastHeartbeat >= MeshConstants::kHeartbeatInterval)
@@ -762,6 +794,7 @@ void SyncManager::loop()
 
   checkDiscoveryCleanup(now);
   checkGroupCleanup(now);
+  purgeRejected(now);
   checkMemberTimeout(now);
   cleanupRelayCache(now);
   cleanupProperties(now);
@@ -855,6 +888,7 @@ void SyncManager::createGroup(uint32_t groupId)
   {
     return;
   }
+  ++membership_;
   currentGroup.groupId = groupId;
   currentGroup.masterDeviceId = ourDeviceId;
   currentGroup.isMaster = true;
@@ -897,6 +931,13 @@ void SyncManager::joinGroup(uint32_t groupId)
   currentGroup.isMaster = false;
   currentGroup.members.clear();
 
+  ++membership_;
+  // Unconfirmed until a roster lists us; give-up counts from the join itself.
+  unlisted_ = true;
+  unlistedSinceMs_ = millis();
+  joinRetryMs_ = MeshConstants::kJoinRetryMs;
+  nextJoinAtMs_ = unlistedSinceMs_ + joinRetryMs_;
+
   // Reset sync state when joining a group (slaves need to sync)
   offsetClock_.reset();
   currentGroup.timeSynced = offsetClock_.isLocked();
@@ -908,9 +949,29 @@ void SyncManager::joinGroup(uint32_t groupId)
   gm.deviceId = ourDeviceId;
   gm.address = ourAddress;
   currentGroup.members[ms] = gm;
-  // send join
+  sendGroupJoin();
+
+  // Request immediate time sync after joining
+  requestTimeSync();
+  lastTimeSync = millis();
+
+  if (onGroupJoined)
+    onGroupJoined(currentGroup);
+
+  // Immediately publish our owned properties so existing members see our latest state.
+  reannounceProperties(millis(), true);
+}
+
+// Sent on joining, and again from checkListed while the master's roster leaves us out.
+void SyncManager::sendGroupJoin()
+{
+  const TransportAddress ourAddress = getOurAddress();
+  if (currentGroup.groupId == 0 || currentGroup.isMaster || !ourAddress.isValid())
+  {
+    return;
+  }
   GroupJoinHeader joinHeader{};
-  joinHeader.groupId = groupId;
+  joinHeader.groupId = currentGroup.groupId;
   joinHeader.deviceId = ourDeviceId;
   std::vector<uint8_t> payload;
   appendStruct(payload, joinHeader);
@@ -924,16 +985,6 @@ void SyncManager::joinGroup(uint32_t groupId)
   {
     sendBroadcastPacketChecked(pkt, "group-join");
   }
-
-  // Request immediate time sync after joining
-  requestTimeSync();
-  lastTimeSync = millis();
-
-  if (onGroupJoined)
-    onGroupJoined(currentGroup);
-
-  // Immediately publish our owned properties so existing members see our latest state.
-  reannounceProperties(millis(), true);
 }
 
 void SyncManager::leaveGroup()
@@ -955,22 +1006,20 @@ void SyncManager::leaveGroup()
     return;
   }
 
+  const bool wasMaster = currentGroup.isMaster;
+  // Drop the group before sending: on a synchronous transport the master's next
+  // roster can arrive inside the send, and must not see us as a member to rejoin.
+  offsetClock_.reset();
+  currentGroup = {};
+  ++membership_;
+  propertyStore_.clearRemoteEntries(ourDeviceId);
+
   for (uint8_t attempt = 0; attempt < 3; ++attempt)
   {
     sendBroadcastPacketChecked(pkt, "group-leave");
   }
-  if (currentGroup.isMaster)
-  {
-    Serial.println("[GroupLeave] Master disbanding group, notifying all slaves");
-  }
-  else
-  {
-    Serial.println("[GroupLeave] Notified group of departure");
-  }
-
-  offsetClock_.reset();
-  currentGroup = {};
-  propertyStore_.clearRemoteEntries(ourDeviceId);
+  Serial.println(wasMaster ? "[GroupLeave] Master disbanding group, notifying all slaves"
+                           : "[GroupLeave] Notified group of departure");
 
   if (onGroupLeft)
     onGroupLeft();
@@ -1093,6 +1142,7 @@ void SyncManager::requestTimeSync()
     return;
   uint32_t reqTs = millis();
   lastTimeReq = reqTs;
+  timeReqPending_ = true;
 
   // Serial.println("[TimeSync] Requesting time sync from master");
 
@@ -1348,6 +1398,10 @@ void SyncManager::handleSyncPacket(const TransportAddress &source, const Transpo
     return;
   }
 
+  if (!isKnownCommand(frame.kind, frame.command))
+  {
+    return;
+  }
   const uint32_t now = millis();
   if (!rememberRelayFrame(frame.originDeviceId, frame.sequence, now))
   {
@@ -1429,6 +1483,10 @@ void SyncManager::processHeartbeat(const MeshProtocol::DecodedFrame &frame, cons
 
   std::string ms = addressToString(heartbeatCmd.address);
   bool isNew = (discoveredDevices.find(ms) == discoveredDevices.end());
+  if (isNew && discoveredDevices.size() >= MeshConstants::kMaxDiscoveredDevices)
+  {
+    return;
+  }
   DiscoveredDevice d{};
   d.deviceId = heartbeatCmd.deviceId;
   d.address = heartbeatCmd.address;
@@ -1452,12 +1510,31 @@ void SyncManager::processGroupAnnounce(const MeshProtocol::DecodedFrame &frame, 
   }
 
   bool isNew = (discoveredGroups.find(announceCmd.groupId) == discoveredGroups.end());
+  if (isNew && discoveredGroups.size() >= MeshConstants::kMaxDiscoveredGroups)
+  {
+    return;
+  }
   GroupAdvert adv;
   adv.groupId = announceCmd.groupId;
   adv.masterDeviceId = announceCmd.masterDeviceId;
   adv.masterAddress = announceCmd.masterAddress;
   adv.lastSeen = millis();
   discoveredGroups[announceCmd.groupId] = adv;
+
+  // Two AUTO partitions that meet each keep a master. Apply the election rule
+  // (lowest device id leads) across groups: the higher master hands over. If the
+  // other group turns out full, checkListed gives up on it and we are free again.
+  const auto isAutoGroup = [](uint32_t gid)
+  { return (gid & MeshConstants::kAutoGroupIdMask) == MeshConstants::kAutoGroupId; };
+  if (syncMode == SyncMode::AUTO && currentGroup.isMaster &&
+      isAutoGroup(currentGroup.groupId) && isAutoGroup(announceCmd.groupId) &&
+      announceCmd.groupId != currentGroup.groupId &&
+      announceCmd.masterDeviceId < ourDeviceId && !isRejected(announceCmd.groupId, adv.lastSeen))
+  {
+    Serial.println("[AutoMode] Lower AUTO master found; merging into its group");
+    joinGroup(announceCmd.groupId);
+  }
+
   if (isNew && onGroupFound)
     onGroupFound(adv);
 }
@@ -1473,10 +1550,33 @@ void SyncManager::processGroupJoin(const MeshProtocol::DecodedFrame &frame, cons
     return;
   }
 
-  if (joinCmd.groupId != currentGroup.groupId)
+  if (joinCmd.groupId != currentGroup.groupId || joinCmd.deviceId != frame.originDeviceId ||
+      joinCmd.deviceId == 0 || joinCmd.deviceId == ourDeviceId)
     return;
 
   std::string ms = addressToString(joinCmd.deviceAddress);
+  const bool known = currentGroup.members.find(ms) != currentGroup.members.end();
+  if (!known && currentGroup.members.size() >= MeshConstants::kMaxGroupMembers)
+  {
+    return; // a larger roster would not fit one group-info frame
+  }
+
+  // A join can beat the member's first heartbeat; seed liveness so the timeout
+  // sweep in this same loop does not drop it at once. No room to track it: refuse.
+  auto seen = discoveredDevices.find(ms);
+  if (seen != discoveredDevices.end())
+  {
+    seen->second.lastSeen = millis();
+  }
+  else if (discoveredDevices.size() < MeshConstants::kMaxDiscoveredDevices)
+  {
+    discoveredDevices[ms] = DiscoveredDevice{joinCmd.deviceId, joinCmd.deviceAddress, millis(), SyncMode::JOIN};
+  }
+  else
+  {
+    return;
+  }
+
   GroupMember gm{
       joinCmd.deviceId,
       joinCmd.deviceAddress,
@@ -1497,8 +1597,17 @@ void SyncManager::processGroupInfo(const MeshProtocol::DecodedFrame &frame, cons
     return;
   }
 
-  if (infoCmd.groupId != currentGroup.groupId)
+  // Only the master we joined may rewrite the roster.
+  if (infoCmd.groupId != currentGroup.groupId ||
+      frame.originDeviceId != currentGroup.masterDeviceId ||
+      infoCmd.masterDeviceId != currentGroup.masterDeviceId)
     return;
+
+  bool listed = false;
+  for (const GroupInfoMember &member : infoCmd.members)
+  {
+    listed = listed || member.deviceId == ourDeviceId;
+  }
 
   std::vector<uint32_t> oldMemberIds;
   oldMemberIds.reserve(currentGroup.members.size());
@@ -1508,7 +1617,6 @@ void SyncManager::processGroupInfo(const MeshProtocol::DecodedFrame &frame, cons
   }
   std::sort(oldMemberIds.begin(), oldMemberIds.end());
 
-  currentGroup.masterDeviceId = infoCmd.masterDeviceId;
   currentGroup.members.clear();
 
   for (const GroupInfoMember &member : infoCmd.members)
@@ -1540,10 +1648,76 @@ void SyncManager::processGroupInfo(const MeshProtocol::DecodedFrame &frame, cons
   std::sort(newMemberIds.begin(), newMemberIds.end());
 
   // Only force publish when membership actually changed.
+  const uint32_t membership = membership_;
   if (oldMemberIds != newMemberIds)
   {
     reannounceProperties(millis(), true);
   }
+
+  // Applied first: a synchronous transport may deliver the master's reply to the
+  // join below before this call returns. Listeners run by the re-announce may have
+  // moved us to another group; then this roster no longer applies.
+  if (membership_ == membership)
+  {
+    checkListed(listed, millis());
+  }
+}
+
+// A follower the master's roster leaves out (lost join, or timed out during an
+// outage) joins again with backoff and jitter. A master that never lists it, such
+// as a full one, is given up on and ignored for kRejectedGroupMs.
+void SyncManager::checkListed(bool listed, uint32_t now)
+{
+  if (listed)
+  {
+    unlisted_ = false;
+    return;
+  }
+  if (!unlisted_)
+  {
+    // Newly left out (for example timed out during an outage): rejoin now, and
+    // count the give-up from here, not from the last confirmation.
+    unlisted_ = true;
+    unlistedSinceMs_ = now;
+    joinRetryMs_ = MeshConstants::kJoinRetryMs;
+    nextJoinAtMs_ = now;
+  }
+  if (now - unlistedSinceMs_ >= MeshConstants::kJoinGiveUpMs)
+  {
+    Serial.println("[GroupJoin] Master never listed us; leaving its group");
+    rejectGroup(currentGroup.groupId, now);
+    leaveGroup();
+    return;
+  }
+  if (static_cast<int32_t>(now - nextJoinAtMs_) >= 0)
+  {
+    sendGroupJoin();
+    joinRetryMs_ = std::min<uint32_t>(joinRetryMs_ * 2, MeshConstants::kJoinRetryMaxMs);
+    nextJoinAtMs_ = now + joinRetryMs_ + esp_random() % (joinRetryMs_ / 2 + 1);
+  }
+}
+
+void SyncManager::purgeRejected(uint32_t now)
+{
+  for (auto it = rejectedGroups_.begin(); it != rejectedGroups_.end();)
+  {
+    it = static_cast<int32_t>(now - it->second) >= 0 ? rejectedGroups_.erase(it) : std::next(it);
+  }
+}
+
+void SyncManager::rejectGroup(uint32_t groupId, uint32_t now)
+{
+  purgeRejected(now);
+  if (rejectedGroups_.size() < 8)
+  {
+    rejectedGroups_[groupId] = now + MeshConstants::kRejectedGroupMs;
+  }
+}
+
+bool SyncManager::isRejected(uint32_t groupId, uint32_t now) const
+{
+  const auto it = rejectedGroups_.find(groupId);
+  return it != rejectedGroups_.end() && static_cast<int32_t>(now - it->second) < 0;
 }
 
 void SyncManager::processGroupLeave(const MeshProtocol::DecodedFrame &frame, const TransportAddress &)
@@ -1554,8 +1728,8 @@ void SyncManager::processGroupLeave(const MeshProtocol::DecodedFrame &frame, con
     return;
   }
 
-  // Ignore if not for our current group
-  if (leaveCmd.groupId != currentGroup.groupId)
+  // Ignore if not for our current group, or sent on someone else's behalf.
+  if (leaveCmd.groupId != currentGroup.groupId || leaveCmd.deviceId != frame.originDeviceId)
     return;
 
   if (currentGroup.isMaster)
@@ -1587,6 +1761,7 @@ void SyncManager::processGroupLeave(const MeshProtocol::DecodedFrame &frame, con
       offsetClock_.reset();
       uint32_t gid = currentGroup.groupId;
       currentGroup = {};
+      ++membership_;
       propertyStore_.clearRemoteEntries(ourDeviceId);
       // Remove the now-dead group from discovery
       discoveredGroups.erase(gid);
@@ -1618,8 +1793,6 @@ void SyncManager::processTimeRequest(const MeshProtocol::DecodedFrame &frame, co
 
   uint32_t now = millis();
 
-  Serial.println("[TimeSync] Master processing time request, responding with time: " + String(now));
-
   TimeResponseCmd responseCmd;
   responseCmd.requestTimestamp = requestCmd.requestTimestamp;
   responseCmd.masterTimestamp = now;
@@ -1646,7 +1819,8 @@ void SyncManager::processTimeResponse(const MeshProtocol::DecodedFrame &frame, c
   {
     return;
   }
-  if (responseCmd.requesterDeviceId != ourDeviceId || responseCmd.groupId != currentGroup.groupId)
+  if (responseCmd.requesterDeviceId != ourDeviceId || responseCmd.groupId != currentGroup.groupId ||
+      !timeReqPending_ || responseCmd.requestTimestamp != lastTimeReq)
   {
     return;
   }
@@ -1661,6 +1835,7 @@ void SyncManager::processTimeResponse(const MeshProtocol::DecodedFrame &frame, c
   }
 
   uint32_t now = millis();
+  timeReqPending_ = false;
   const bool accepted = offsetClock_.handleSample(responseCmd.requestTimestamp, responseCmd.masterTimestamp, now);
   if (!accepted)
   {
@@ -1854,11 +2029,16 @@ void SyncManager::checkJoinMode(uint32_t)
   if (currentGroup.groupId != 0)
     return;
 
-  // In JOIN mode, immediately join any discovered group
-  if (!discoveredGroups.empty())
+  // In JOIN mode, immediately join any discovered group we have not given up on.
+  const uint32_t now = millis();
+  for (const auto &kv : discoveredGroups)
   {
-    Serial.println("[JoinMode] Found group, joining immediately...");
-    joinGroup(discoveredGroups.begin()->first);
+    if (!isRejected(kv.first, now))
+    {
+      Serial.println("[JoinMode] Found group, joining immediately...");
+      joinGroup(kv.first);
+      return;
+    }
   }
 }
 
@@ -1908,7 +2088,8 @@ void SyncManager::checkAutoMode(uint32_t now)
   uint32_t discoveredAutoGroupId = 0;
   for (const auto &kv : discoveredGroups)
   {
-    if ((kv.first & MeshConstants::kAutoGroupIdMask) != MeshConstants::kAutoGroupId)
+    if ((kv.first & MeshConstants::kAutoGroupIdMask) != MeshConstants::kAutoGroupId ||
+        isRejected(kv.first, now))
     {
       continue;
     }
@@ -2135,10 +2316,11 @@ bool SyncManager::rememberRelayFrame(uint32_t originDeviceId, uint32_t sequence,
     cleanupRelayCache(now);
     if (relaySeenFrames_.size() >= MeshConstants::kRelaySeenMax)
     {
+      // Compare ages, not raw timestamps, so millis() rollover picks the right one.
       auto oldest = relaySeenFrames_.begin();
       for (auto it = relaySeenFrames_.begin(); it != relaySeenFrames_.end(); ++it)
       {
-        if (it->second < oldest->second)
+        if (now - it->second > now - oldest->second)
         {
           oldest = it;
         }
@@ -2288,38 +2470,34 @@ bool SyncManager::setPropertyBytes(uint16_t key, const uint8_t *data, uint8_t le
     return false;
   }
 
-  PropertySnapshot snapshot{};
-  if (!propertyStore_.setLocal(key, ourDeviceId, data, len, millis(), snapshot))
+  uint16_t revision = 0;
+  if (!propertyStore_.setLocal(key, ourDeviceId, data, len, millis(), revision))
   {
     return false;
   }
-
+  // Build the frame from the caller's bytes before any listener runs: a listener
+  // may change them or switch groups.
   std::vector<uint8_t> payload;
-  if (!MeshProtocol::appendPropertyEntry(payload, key, snapshot.revision, data, len))
-  {
-    return false;
-  }
-
   TransportPacket pkt{};
-  if (!buildLocalMeshPacket(pkt,
-                            MeshProtocol::MessageKind::Property,
-                            static_cast<uint8_t>(MeshProtocol::PropertyCommand::Update),
-                            payload.data(),
-                            static_cast<uint16_t>(payload.size())))
-  {
-    return false;
-  }
-  if (!sendBroadcastPacketChecked(pkt, "property-update"))
-  {
-    return false;
-  }
-  notifyPropertyChange(key, ourDeviceId, data, len);
-  return true;
+  const bool built = MeshProtocol::appendPropertyEntry(payload, key, revision, data, len) &&
+                     buildLocalMeshPacket(pkt,
+                                          MeshProtocol::MessageKind::Property,
+                                          static_cast<uint8_t>(MeshProtocol::PropertyCommand::Update),
+                                          payload.data(),
+                                          static_cast<uint16_t>(payload.size()));
+  const uint32_t membership = membership_;
+
+  // The value is committed: local listeners hear it now, and a failed send is
+  // repaired by the periodic re-announce.
+  const bool copied = payload.size() == sizeof(MeshProtocol::PropertyEntryHeader) + len;
+  notifyPropertyChange(key, ourDeviceId, copied ? payload.data() + sizeof(MeshProtocol::PropertyEntryHeader) : data, len);
+
+  return built && membership_ == membership && sendBroadcastPacketChecked(pkt, "property-update");
 }
 
-bool SyncManager::getPropertyBytesForOwner(uint16_t key, uint32_t ownerDeviceId, std::vector<uint8_t> &out) const
+bool SyncManager::readPropertyBytes(uint16_t key, uint32_t ownerDeviceId, uint8_t *out, uint8_t cap, uint8_t &outLen) const
 {
-  return propertyStore_.get(key, ownerDeviceId, out);
+  return propertyStore_.read(key, ownerDeviceId, out, cap, outLen);
 }
 
 bool SyncManager::hasPropertyValue(uint16_t key, uint32_t ownerDeviceId) const
@@ -2343,7 +2521,7 @@ void SyncManager::addPropertyChangeCallback(uint16_t key, std::function<void(uin
   {
     return;
   }
-  it->second.callbacks.push_back(std::move(cb));
+  it->second.callbacks.push_back(std::make_shared<const ByteCallback>(std::move(cb)));
 }
 
 void SyncManager::clearPropertyChangeCallbacks(uint16_t key)
@@ -2402,7 +2580,7 @@ void SyncManager::addEventCallback(uint16_t channelId, std::function<void(uint32
   {
     return;
   }
-  it->second.callbacks.push_back(std::move(cb));
+  it->second.callbacks.push_back(std::make_shared<const ByteCallback>(std::move(cb)));
 }
 
 void SyncManager::clearEventCallbacks(uint16_t channelId)
@@ -2415,30 +2593,31 @@ void SyncManager::clearEventCallbacks(uint16_t channelId)
   it->second.callbacks.clear();
 }
 
+// Listeners may unregister the key or add listeners while being called, so look
+// the list up again for every call and hold the callable we are running.
+template <typename Registry>
+static void notifyAll(Registry &registry, uint16_t id, uint32_t fromDeviceId, const uint8_t *data, uint8_t len)
+{
+  for (size_t i = 0;; ++i)
+  {
+    auto it = registry.find(id);
+    if (it == registry.end() || i >= it->second.callbacks.size())
+    {
+      return;
+    }
+    const auto cb = it->second.callbacks[i];
+    (*cb)(fromDeviceId, data, len);
+  }
+}
+
 void SyncManager::notifyPropertyChange(uint16_t key, uint32_t ownerDeviceId, const uint8_t *data, uint8_t len)
 {
-  auto it = propertyRegistry_.find(key);
-  if (it == propertyRegistry_.end())
-  {
-    return;
-  }
-  for (auto &cb : it->second.callbacks)
-  {
-    cb(ownerDeviceId, data, len);
-  }
+  notifyAll(propertyRegistry_, key, ownerDeviceId, data, len);
 }
 
 void SyncManager::notifyEvent(uint16_t channelId, uint32_t fromDeviceId, const uint8_t *payload, uint8_t payloadLen)
 {
-  auto it = eventRegistry_.find(channelId);
-  if (it == eventRegistry_.end())
-  {
-    return;
-  }
-  for (auto &cb : it->second.callbacks)
-  {
-    cb(fromDeviceId, payload, payloadLen);
-  }
+  notifyAll(eventRegistry_, channelId, fromDeviceId, payload, payloadLen);
 }
 
 bool SyncManager::applyIncomingPropertyEntry(uint16_t key, uint16_t revision, uint32_t ownerDeviceId, const uint8_t *value, uint8_t valueLen)
@@ -2449,9 +2628,8 @@ bool SyncManager::applyIncomingPropertyEntry(uint16_t key, uint16_t revision, ui
     return false;
   }
 
-  PropertySnapshot snapshot{};
   bool changed = false;
-  if (!propertyStore_.applyRemote(key, ownerDeviceId, revision, value, valueLen, millis(), snapshot, changed))
+  if (!propertyStore_.applyRemote(key, ownerDeviceId, revision, value, valueLen, millis(), changed))
   {
     return false;
   }
@@ -2491,6 +2669,8 @@ void SyncManager::processPropertyBatch(const MeshProtocol::DecodedFrame &frame, 
     return;
   }
   const uint8_t count = frame.payload[0];
+
+  // Validate the whole batch first: a malformed tail must not leave a prefix applied.
   uint16_t offset = 1;
   for (uint8_t i = 0; i < count; ++i)
   {
@@ -2501,6 +2681,21 @@ void SyncManager::processPropertyBatch(const MeshProtocol::DecodedFrame &frame, 
     {
       return;
     }
+    offset = next;
+  }
+  if (offset != frame.payloadLen)
+  {
+    return;
+  }
+
+  offset = 1;
+  const uint32_t membership = membership_;
+  for (uint8_t i = 0; i < count && membership_ == membership; ++i) // a listener may leave or switch groups
+  {
+    MeshProtocol::PropertyEntryHeader entry{};
+    const uint8_t *value = nullptr;
+    uint16_t next = 0;
+    MeshProtocol::readPropertyEntryAt(frame.payload, frame.payloadLen, offset, next, entry, value);
     applyIncomingPropertyEntry(entry.key, entry.revision, frame.originDeviceId, value, entry.valueLen);
     offset = next;
   }
@@ -2519,12 +2714,15 @@ void SyncManager::processEventEmit(const MeshProtocol::DecodedFrame &frame, cons
   {
     return;
   }
-  auto regIt = eventRegistry_.find(header.channelId);
+  // Copied out of the packed header: map::find takes a reference, and a
+  // misaligned one faults on Xtensa.
+  const uint16_t channelId = header.channelId;
+  auto regIt = eventRegistry_.find(channelId);
   if (regIt == eventRegistry_.end() || header.payloadLen > regIt->second.maxLen)
   {
     return;
   }
-  notifyEvent(header.channelId, frame.originDeviceId, payload, header.payloadLen);
+  notifyEvent(channelId, frame.originDeviceId, payload, header.payloadLen);
 }
 
 void SyncManager::cleanupProperties(uint32_t now)
@@ -2545,13 +2743,8 @@ void SyncManager::reannounceProperties(uint32_t now, bool force)
   }
   lastPropertyReannounce = now;
 
-  const std::vector<PropertySnapshot> owned = propertyStore_.getOwnedBy(ourDeviceId);
-  if (owned.empty())
-  {
-    return;
-  }
-
   std::vector<uint8_t> payload;
+  payload.reserve(MeshConstants::kMaxMeshPayload);
   payload.push_back(0);
   uint8_t count = 0;
 
@@ -2576,26 +2769,21 @@ void SyncManager::reannounceProperties(uint32_t now, bool force)
     count = 0;
   };
 
-  for (const auto &prop : owned)
-  {
-    const uint16_t entrySize = static_cast<uint16_t>(sizeof(MeshProtocol::PropertyEntryHeader) + prop.payload.size());
+  propertyStore_.forEachOwnedBy(ourDeviceId, [&](const PropertyStore::PropertyEntry &prop)
+                                {
+    const uint16_t entrySize = static_cast<uint16_t>(sizeof(MeshProtocol::PropertyEntryHeader) + prop.valueLen);
     if (entrySize + 1 > MeshConstants::kMaxMeshPayload)
     {
-      continue;
+      return;
     }
     if (payload.size() + entrySize > MeshConstants::kMaxMeshPayload)
     {
       flushBatch();
     }
-    if (MeshProtocol::appendPropertyEntry(payload,
-                                          prop.key,
-                                          prop.revision,
-                                          prop.payload.empty() ? nullptr : prop.payload.data(),
-                                          static_cast<uint8_t>(prop.payload.size())))
+    if (MeshProtocol::appendPropertyEntry(payload, prop.key, prop.revision, prop.value.data(), prop.valueLen))
     {
       ++count;
-    }
-  }
+    } });
   flushBatch();
 }
 
@@ -2623,17 +2811,12 @@ uint8_t RawPropertyHandle::get(uint32_t deviceId, uint8_t *outBuf, uint8_t bufSi
   {
     return 0;
   }
-  std::vector<uint8_t> bytes;
-  if (!manager_->getPropertyBytesForOwner(key_, deviceId, bytes))
+  uint8_t len = 0;
+  if (!manager_->readPropertyBytes(key_, deviceId, outBuf, bufSize, len))
   {
     return 0;
   }
-  const uint8_t toCopy = static_cast<uint8_t>(std::min<size_t>(bytes.size(), bufSize));
-  if (toCopy > 0)
-  {
-    memcpy(outBuf, bytes.data(), toCopy);
-  }
-  return toCopy;
+  return std::min(len, bufSize);
 }
 
 bool RawPropertyHandle::has(uint32_t deviceId) const

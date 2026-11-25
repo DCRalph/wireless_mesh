@@ -1,5 +1,15 @@
 #include "Direct.h"
 
+#include <algorithm>
+
+namespace
+{
+  bool deadlinePassed(uint32_t now, uint32_t deadlineMs)
+  {
+    return static_cast<int32_t>(now - deadlineMs) >= 0;
+  }
+} // namespace
+
 DirectComms *DirectComms::getInstance()
 {
   static DirectComms instance;
@@ -29,7 +39,16 @@ bool DirectComms::begin(ITransport *transport)
 
 void DirectComms::end()
 {
-  pendingRequests_.clear();
+  // Detach first: a callback may issue a new request while we complete these.
+  std::vector<PendingRequest> cancelled;
+  cancelled.swap(pendingRequests_);
+  for (auto &pending : cancelled)
+  {
+    if (pending.onResult)
+    {
+      pending.onResult(false, nullptr, 0);
+    }
+  }
 }
 
 void DirectComms::loop()
@@ -40,11 +59,11 @@ void DirectComms::loop()
   }
   const uint32_t now = millis();
 
-  // Drain first so a callback can re-enter request()/cancel without invalidating iteration.
+  // Drain first so a callback can re-enter request() without invalidating iteration.
   std::vector<PendingResponseCb> expired;
   for (auto it = pendingRequests_.begin(); it != pendingRequests_.end();)
   {
-    if (static_cast<int32_t>(now - it->deadlineMs) >= 0)
+    if (deadlinePassed(now, it->deadlineMs))
     {
       expired.push_back(std::move(it->onResult));
       it = pendingRequests_.erase(it);
@@ -69,14 +88,45 @@ ITransport::ReceiveCallback DirectComms::receiveCallback()
   { handleIncoming(source, packet); };
 }
 
+bool DirectComms::isPending(uint16_t requestId) const
+{
+  for (const auto &pending : pendingRequests_)
+  {
+    if (pending.requestId == requestId)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
 uint16_t DirectComms::allocateRequestId()
 {
-  uint16_t id = nextRequestId_++;
-  if (nextRequestId_ == 0)
+  // Skip 0 (OneWay frames) and any id still awaiting a reply, so a late reply to
+  // an old request can never complete a new one.
+  for (uint32_t tries = 0; tries < 0x10000u; ++tries)
   {
-    nextRequestId_ = 1; // 0 is reserved for OneWay frames
+    const uint16_t id = nextRequestId_++;
+    if (id != 0 && !isPending(id))
+    {
+      return id;
+    }
   }
-  return id;
+  return 0; // 65535 requests in flight
+}
+
+bool DirectComms::takePending(uint16_t requestId, PendingResponseCb &out)
+{
+  for (auto it = pendingRequests_.begin(); it != pendingRequests_.end(); ++it)
+  {
+    if (it->requestId == requestId)
+    {
+      out = std::move(it->onResult);
+      pendingRequests_.erase(it);
+      return true;
+    }
+  }
+  return false;
 }
 
 bool DirectComms::sendFrame(const TransportAddress &peer,
@@ -95,7 +145,7 @@ bool DirectComms::sendFrame(const TransportAddress &peer,
     return false;
   }
 
-  TransportPacket pkt{};
+  TransportPacket pkt;
   pkt.type = DirectFraming::kDirectPacketType;
   pkt.len = static_cast<uint16_t>(sizeof(DirectFraming::Header) + payloadLen);
 
@@ -138,6 +188,22 @@ bool DirectComms::sendRequestRaw(uint16_t channelId,
     return false;
   }
   const uint16_t requestId = allocateRequestId();
+  if (requestId == 0)
+  {
+    onResult(false, nullptr, 0);
+    return false;
+  }
+
+  // Register before sending: a synchronous transport may deliver the reply from
+  // inside sendPacket().
+  PendingRequest entry;
+  entry.requestId = requestId;
+  entry.channelId = channelId;
+  entry.peer = peer;
+  entry.deadlineMs = millis() + std::min(timeoutMs, DirectFraming::kMaxTimeoutMs);
+  entry.onResult = std::move(onResult);
+  pendingRequests_.push_back(std::move(entry));
+
   if (!sendFrame(peer,
                  DirectFraming::Kind::Request,
                  channelId,
@@ -145,17 +211,13 @@ bool DirectComms::sendRequestRaw(uint16_t channelId,
                  payload,
                  payloadLen))
   {
-    // Don't enqueue a pending request the radio refused.
-    onResult(false, nullptr, 0);
+    PendingResponseCb cb;
+    if (takePending(requestId, cb) && cb)
+    {
+      cb(false, nullptr, 0);
+    }
     return false;
   }
-
-  PendingRequest entry;
-  entry.requestId = requestId;
-  entry.channelId = channelId;
-  entry.deadlineMs = millis() + timeoutMs;
-  entry.onResult = std::move(onResult);
-  pendingRequests_.push_back(std::move(entry));
   return true;
 }
 
@@ -166,7 +228,7 @@ void DirectComms::registerOneWayHandler(uint16_t channelId, OneWayHandler cb)
     oneWayHandlers_.erase(channelId);
     return;
   }
-  oneWayHandlers_[channelId] = std::move(cb);
+  oneWayHandlers_[channelId] = std::make_shared<const OneWayHandler>(std::move(cb));
 }
 
 void DirectComms::registerRequestHandler(uint16_t channelId,
@@ -177,7 +239,7 @@ void DirectComms::registerRequestHandler(uint16_t channelId,
     requestHandlers_.erase(channelId);
     return;
   }
-  requestHandlers_[channelId] = std::move(handler);
+  requestHandlers_[channelId] = std::make_shared<const RawRequestHandler>(std::move(handler));
 }
 
 void DirectComms::handleIncoming(const TransportAddress &source,
@@ -187,21 +249,26 @@ void DirectComms::handleIncoming(const TransportAddress &source,
   {
     return;
   }
-  if (packet.len < sizeof(DirectFraming::Header))
+  if (packet.len < sizeof(DirectFraming::Header) || packet.len > TransportPacket::kMaxData)
   {
     return;
   }
 
-  DirectFraming::Header hdr{};
-  std::memcpy(&hdr, packet.data, sizeof(hdr));
+  DirectFraming::Header packed{};
+  std::memcpy(&packed, packet.data, sizeof(packed));
+  // Copy out of the packed header: references to its fields (std::map::find takes
+  // one) would be misaligned, which faults on Xtensa.
+  struct
+  {
+    uint8_t kind;
+    uint16_t channelId;
+    uint16_t requestId;
+    uint8_t payloadLen;
+  } const hdr{packed.kind, packed.channelId, packed.requestId, packed.payloadLen};
 
   const uint16_t expectedLen =
       static_cast<uint16_t>(sizeof(DirectFraming::Header)) + hdr.payloadLen;
-  if (packet.len != expectedLen)
-  {
-    return;
-  }
-  if (hdr.payloadLen > DirectFraming::kMaxPayloadSize)
+  if (packet.len != expectedLen || hdr.payloadLen > DirectFraming::kMaxPayloadSize)
   {
     return;
   }
@@ -212,23 +279,26 @@ void DirectComms::handleIncoming(const TransportAddress &source,
   {
   case DirectFraming::Kind::OneWay:
   {
-    auto it = oneWayHandlers_.find(hdr.channelId);
-    if (it != oneWayHandlers_.end() && it->second)
+    const auto it = oneWayHandlers_.find(hdr.channelId);
+    if (it == oneWayHandlers_.end())
     {
-      it->second(source, payload, hdr.payloadLen);
+      return;
     }
+    const std::shared_ptr<const OneWayHandler> handler = it->second;
+    (*handler)(source, payload, hdr.payloadLen);
     break;
   }
   case DirectFraming::Kind::Request:
   {
-    auto it = requestHandlers_.find(hdr.channelId);
-    if (it == requestHandlers_.end() || !it->second)
+    const auto it = requestHandlers_.find(hdr.channelId);
+    if (it == requestHandlers_.end() || hdr.requestId == 0)
     {
       return;
     }
+    const std::shared_ptr<const RawRequestHandler> handler = it->second;
     uint8_t respBuf[DirectFraming::kMaxPayloadSize];
     uint8_t respLen = 0;
-    if (!it->second(source,
+    if (!(*handler)(source,
                     payload,
                     hdr.payloadLen,
                     respBuf,
@@ -247,19 +317,27 @@ void DirectComms::handleIncoming(const TransportAddress &source,
   }
   case DirectFraming::Kind::Response:
   {
-    for (size_t i = 0; i < pendingRequests_.size(); ++i)
+    const uint32_t now = millis();
+    for (auto it = pendingRequests_.begin(); it != pendingRequests_.end(); ++it)
     {
-      if (pendingRequests_[i].requestId == hdr.requestId &&
-          pendingRequests_[i].channelId == hdr.channelId)
+      if (it->requestId != hdr.requestId || it->channelId != hdr.channelId)
       {
-        auto cb = std::move(pendingRequests_[i].onResult);
-        pendingRequests_.erase(pendingRequests_.begin() + i);
-        if (cb)
-        {
-          cb(true, payload, hdr.payloadLen);
-        }
+        continue;
+      }
+      // Only the peer that was asked may answer, unless the request was a broadcast.
+      const bool askedAll = transport_ != nullptr && it->peer == transport_->broadcastAddress();
+      if (source != it->peer && !askedAll)
+      {
         return;
       }
+      PendingResponseCb cb = std::move(it->onResult);
+      const bool inTime = !deadlinePassed(now, it->deadlineMs);
+      pendingRequests_.erase(it);
+      if (cb)
+      {
+        cb(inTime, inTime ? payload : nullptr, inTime ? hdr.payloadLen : 0);
+      }
+      return;
     }
     break;
   }

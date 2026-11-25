@@ -111,6 +111,15 @@ The transport envelope itself, including `TransportPacket`, `TransportAddress`, 
   - the smallest discovered `deviceId` becomes the elected creator
   - the elected creator generates `kAutoGroupId | (random16)` and hosts that group
   - other AUTO nodes look for discovered group IDs whose high 16 bits match `MeshConstants::kAutoGroupIdMask` and join the first matching live group
+  - when two AUTO groups meet (partitions that rejoined), the master with the higher `deviceId` joins the other group, so they converge on one
+
+Group membership:
+
+- A follower that finds itself missing from its master's roster (lost join, or timed out during an outage) sends `Join` again, starting after `kJoinRetryMs` and doubling up to `kJoinRetryMaxMs`, with jitter so followers do not answer one roster together.
+- A follower still unlisted after `kJoinGiveUpMs` leaves and ignores that group for `kRejectedGroupMs`; JOIN and AUTO pick another group or wait.
+- The master caps a roster at `kMaxGroupMembers` (20), what one group-info frame can carry, and ignores further joins, as it does when its discovery table has no room to track the joiner.
+- Rosters are accepted only from the group's master, joins and leaves only from the device they name. These are identity checks on the device id in each frame, not authentication: any radio in range can still forge frames.
+- Relay is on by default. Every node rebroadcasts each frame once, so airtime grows with the square of the group size; turn it off with `setRelayEnabled(false)` on single-hop deployments.
 
 ## 6) Size limits
 
@@ -118,10 +127,12 @@ The key payload limits from `MeshConstants` are:
 
 | Constant | Value | Meaning |
 |---|---:|---|
-| `kMaxMeshPayload` | 235 | Maximum mesh payload bytes after the 15-byte mesh header |
-| `kMaxPropertyValueSize` | 230 | Maximum bytes in one property value |
-| `kMaxEventPayloadSize` | 232 | Maximum bytes in one event payload |
+| `kMaxMeshPayload` | 231 | Maximum mesh payload bytes after the 15-byte mesh header (one ESP-NOW frame) |
+| `kMaxPropertyValueSize` | 225 | Maximum bytes in one property value; fits both an update and a batch |
+| `kMaxEventPayloadSize` | 228 | Maximum bytes in one event payload |
 | `kMaxPropertyEntries` | 200 | Maximum entries stored by `PropertyStore` |
+| `kMaxGroupMembers` | 20 | Largest roster one group-info frame carries |
+| `kMaxDiscoveredDevices` / `kMaxDiscoveredGroups` | 32 / 16 | Discovery table caps; new entries past them are ignored |
 
 ## 7) Property model
 
@@ -138,7 +149,9 @@ Properties are partitioned by `(key, ownerDeviceId)`.
   - the property key is registered locally
   - the incoming payload length fits the registered max length
   - the revision is newer according to `MeshProtocol::isNewerRevision()`
-- Accepted updates trigger registered property callbacks.
+- A batch is applied only if every entry in it parses and the entries fill the frame exactly.
+- Accepted updates trigger registered property callbacks. A repeat of the stored revision (the periodic re-announce) only refreshes liveness, so an unchanged value is never evicted and reported again.
+- A local `set()` commits and notifies local listeners even if the radio refuses the send; the next re-announce publishes it.
 
 ### Property reannounce and cleanup
 
@@ -211,9 +224,9 @@ All current mesh tunables are defined in `MeshConstants` in `src/Mesh.h`.
 | `kMeshPacketType` | `0xBEEF` | Transport packet type used for mesh frames |
 | `kProtocolVersion` | `2` | Mesh frame version |
 | `kFlagNoRelay` | `0x01` | Frame flag that disables relay forwarding |
-| `kMaxMeshPayload` | `235` | Maximum payload bytes per mesh frame |
-| `kMaxEventPayloadSize` | `232` | Maximum event payload bytes |
-| `kMaxPropertyValueSize` | `230` | Maximum property value bytes |
+| `kMaxMeshPayload` | `231` | Maximum payload bytes per mesh frame |
+| `kMaxEventPayloadSize` | `228` | Maximum event payload bytes |
+| `kMaxPropertyValueSize` | `225` | Maximum property value bytes |
 | `kMaxPropertyEntries` | `200` | Maximum property-store entries |
 | `kPropertyReannounceIntervalMs` | `5000` | Periodic property republish interval |
 | `kPropertyCleanupIntervalMs` | `10000` | Property cleanup cadence |
@@ -224,6 +237,12 @@ All current mesh tunables are defined in `MeshConstants` in `src/Mesh.h`.
 | `kGroupDiscoveryTimeout` | `6000` | Group advertisement timeout |
 | `kGroupInfoInterval` | `2000` | Group info interval |
 | `kGroupMemberTimeout` | `8000` | Group member timeout |
+| `kMaxGroupMembers` | `20` | Largest roster that fits one frame |
+| `kJoinRetryMs` / `kJoinRetryMaxMs` | `1000` / `8000` | First and longest gap between join retries |
+| `kJoinGiveUpMs` | `10000` | Unlisted this long, a follower leaves the group |
+| `kRejectedGroupMs` | `60000` | How long a given-up group is ignored |
+| `kMaxDiscoveredDevices` | `32` | Discovered-device table cap |
+| `kMaxDiscoveredGroups` | `16` | Discovered-group table cap |
 | `kAutoGroupId` | `0xA1100000` | AUTO group ID base |
 | `kAutoGroupIdMask` | `0xFFFF0000` | Mask used to recognize AUTO groups |
 | `kTimeSyncInterval` | `10000` | Time sync request interval |

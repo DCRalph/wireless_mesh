@@ -77,12 +77,21 @@ struct TransportAddress
   }
 };
 
+// On air a packet is type + len + len bytes of data. ESP-NOW v1 caps a frame at
+// 250 bytes (ESP_NOW_MAX_DATA_LEN), so the header leaves 246 for data. Every
+// layer above derives its limits from kMaxData.
 struct __attribute__((packed)) TransportPacket
 {
+  static constexpr uint16_t kMaxFrame = 250;
+  static constexpr uint16_t kHeaderSize = 4; // type + len
+  static constexpr uint16_t kMaxData = kMaxFrame - kHeaderSize;
+
   uint16_t type = 0;
   uint16_t len = 0;
-  uint8_t data[250]{};
+  uint8_t data[kMaxData]{};
 };
+
+static_assert(sizeof(TransportPacket) == TransportPacket::kMaxFrame, "TransportPacket must match one ESP-NOW frame");
 
 class ITransport
 {
